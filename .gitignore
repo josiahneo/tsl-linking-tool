@@ -1,0 +1,10 @@
+node_modules
+dist
+dist-ssr
+*.local
+.DS_Store
+
+# Raw monthly source exports are too large for git (the index CSV is ~200 MB).
+# Keep them locally; commit the generated public/linkdata.json instead — that is
+# the artifact Vercel builds and serves. Regenerate with `npm run build-data`.
+data/**/*.csv
