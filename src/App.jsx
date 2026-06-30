@@ -484,6 +484,183 @@ function ScorePill({ score }) {
   );
 }
 
+// Shared BM25 pass — returns Map(docIdx -> score) for the given query terms.
+// Only docs sharing a term are touched (via the inverted index).
+function bm25Scores(dataset, qTokens) {
+  const { articles, inverted, N, avgdl } = dataset;
+  const scores = new Map();
+  for (const t of qTokens) {
+    const postings = inverted.get(t);
+    if (!postings) continue;
+    const df = postings.length;
+    const idf = Math.log(1 + (N - df + 0.5) / (df + 0.5));
+    for (const [i, wtf] of postings) {
+      const a = articles[i];
+      const s = idf * (wtf * (BM25_K1 + 1)) / (wtf + BM25_K1 * (1 - BM25_B + BM25_B * (a.dl / avgdl)));
+      scores.set(i, (scores.get(i) || 0) + s);
+    }
+  }
+  return scores;
+}
+
+// Orphans tab — articles with few/no inbound internal links, and where to add
+// them. Same dataset as the linker, inverse operation: instead of "what should
+// this link to", it asks "what isn't being linked to, and who should link it".
+function OrphanView({ dataset, copyUrl, copiedKey }) {
+  const { articles, inboundAdj } = dataset;
+  const [maxInbound, setMaxInbound] = useState(0);
+  const [minViews, setMinViews] = useState(1000);
+  const [selected, setSelected] = useState(null); // article idx
+
+  const orphans = useMemo(() => {
+    return articles
+      .filter((a) => a.inbound <= maxInbound && a.sessions >= minViews)
+      .sort((a, b) => b.sessions - a.sessions);
+  }, [articles, maxInbound, minViews]);
+
+  // For a selected orphan, suggest high-relevance source articles that should
+  // link to it — excluding itself and any that already link to it.
+  const linkFrom = useMemo(() => {
+    if (selected == null) return [];
+    const orphan = articles[selected];
+    const q = [...new Set(tokenise(`${orphan.title} ${orphan.keyword}`))];
+    if (!q.length) return [];
+    const already = new Set(inboundAdj[selected]);
+    const scores = bm25Scores(dataset, q);
+    let maxBm = 0;
+    for (const v of scores.values()) if (v > maxBm) maxBm = v;
+    const out = [];
+    for (const [i, sc] of scores) {
+      if (i === selected || already.has(i)) continue;
+      out.push({ ...articles[i], rel: maxBm > 0 ? sc / maxBm : 0, finalRaw: sc * (1 + TRAFFIC_ALPHA * (articles[i].trafficWeight || 0)) });
+    }
+    return out.sort((a, b) => b.finalRaw - a.finalRaw).slice(0, 8);
+  }, [selected, articles, inboundAdj, dataset]);
+
+  const inboundBadge = (n) => (
+    <span style={{ fontSize: 10, fontWeight: 700, borderRadius: 10, padding: "2px 7px",
+      background: n === 0 ? C.redLight : "#FFF3E0", color: n === 0 ? C.red : C.orange,
+      border: `1px solid ${n === 0 ? C.red : "#F5A623"}` }}>
+      {n === 0 ? "0 inbound" : `${n} inbound`}
+    </span>
+  );
+
+  return (
+    <>
+      <div style={{ background: C.surface, borderRadius: 8, border: `1px solid ${C.border}`, padding: "14px 18px", marginBottom: 16 }}>
+        <div style={{ fontSize: 13, color: C.textSecondary, lineHeight: 1.6 }}>
+          Articles with few or no <b style={{ color: C.textPrimary }}>inbound internal links</b> — search engines crawl and rank
+          them worse. Prioritise the high-traffic ones, then add links to them from the suggested related articles.
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 18, flexWrap: "wrap", marginTop: 14 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <label style={{ fontSize: 11, color: C.textSecondary }}>Max inbound links</label>
+            <select value={maxInbound} onChange={(e) => { setMaxInbound(+e.target.value); setSelected(null); }}
+              style={{ border: `1px solid ${C.border}`, borderRadius: 4, padding: "3px 6px", fontSize: 11, fontFamily: "inherit", background: C.bg, color: C.textPrimary }}>
+              <option value={0}>0 (true orphans)</option>
+              <option value={1}>≤ 1</option>
+              <option value={2}>≤ 2 (weak)</option>
+              <option value={5}>≤ 5</option>
+            </select>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <label style={{ fontSize: 11, color: C.textSecondary }}>Min views</label>
+            <select value={minViews} onChange={(e) => { setMinViews(+e.target.value); setSelected(null); }}
+              style={{ border: `1px solid ${C.border}`, borderRadius: 4, padding: "3px 6px", fontSize: 11, fontFamily: "inherit", background: C.bg, color: C.textPrimary }}>
+              <option value={0}>Any</option>
+              <option value={1000}>1k+</option>
+              <option value={5000}>5k+</option>
+              <option value={20000}>20k+</option>
+            </select>
+          </div>
+          <div style={{ marginLeft: "auto", fontSize: 11, color: C.textSecondary }}>
+            {fmt(orphans.length)} {maxInbound === 0 ? "orphans" : "low-link articles"} match
+          </div>
+        </div>
+      </div>
+
+      {orphans.length === 0 ? (
+        <div style={{ textAlign: "center", padding: "40px 24px", color: C.textSecondary, fontSize: 13, background: C.surface, borderRadius: 8, border: `1px solid ${C.border}` }}>
+          None match these filters. Try raising max inbound or lowering min views.
+        </div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 1 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 90px 90px 90px", padding: "7px 14px", fontSize: 10, fontWeight: 700, letterSpacing: "0.07em", color: C.textMuted, textTransform: "uppercase", borderRadius: "8px 8px 0 0", background: C.bg, border: `1px solid ${C.border}` }}>
+            <span>Orphaned article</span>
+            <span style={{ textAlign: "right" }}>Views</span>
+            <span style={{ textAlign: "center" }}>Inbound</span>
+            <span style={{ textAlign: "center" }}>Fix</span>
+          </div>
+          {orphans.slice(0, 100).map((a, i) => {
+            const fd = fmtDate(a.modified);
+            const isOpen = selected === a.idx;
+            return (
+              <div key={a.url} style={{ background: C.surface, border: `1px solid ${C.border}`, borderTop: "none",
+                borderRadius: i === Math.min(orphans.length, 100) - 1 && !isOpen ? "0 0 8px 8px" : 0 }}>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 90px 90px 90px", alignItems: "center", padding: "10px 14px" }}>
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontSize: 13, fontWeight: 500, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{a.title}</div>
+                    <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 2 }}>
+                      <span style={{ fontSize: 10, color: C.textMuted, fontFamily: "monospace", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{shortUrl(a.url)}</span>
+                      {fd && <span style={{ fontSize: 9, fontWeight: 600, color: fd.color, whiteSpace: "nowrap" }}>↻ {fd.label}</span>}
+                    </div>
+                  </div>
+                  <div style={{ textAlign: "right", fontSize: 12, fontWeight: 600, fontVariantNumeric: "tabular-nums" }}>{a.sessions > 0 ? fmt(a.sessions) : "—"}</div>
+                  <div style={{ display: "flex", justifyContent: "center" }}>{inboundBadge(a.inbound)}</div>
+                  <div style={{ display: "flex", justifyContent: "center" }}>
+                    <button onClick={() => setSelected(isOpen ? null : a.idx)}
+                      style={{ padding: "5px 10px", borderRadius: 5, border: `1px solid ${isOpen ? C.red : C.border}`,
+                        background: isOpen ? C.red : C.bg, color: isOpen ? "#fff" : C.textSecondary,
+                        fontSize: 11, cursor: "pointer", fontFamily: "inherit", fontWeight: 600, whiteSpace: "nowrap" }}>
+                      {isOpen ? "Hide" : "Link it"}
+                    </button>
+                  </div>
+                </div>
+                {isOpen && (
+                  <div style={{ padding: "4px 14px 14px", background: "#FAFAF8", borderTop: `1px dashed ${C.border}` }}>
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", margin: "10px 0 8px" }}>
+                      <span style={{ fontSize: 11, fontWeight: 700, color: C.textSecondary }}>Add a link to this orphan from:</span>
+                      <button onClick={() => copyUrl(a)}
+                        style={{ padding: "4px 9px", borderRadius: 5, border: `1px solid ${C.border}`,
+                          background: copiedKey === a.url ? C.greenLight : C.surface, color: copiedKey === a.url ? C.green : C.textSecondary,
+                          fontSize: 10, cursor: "pointer", fontFamily: "inherit", fontWeight: 600 }}>
+                        {copiedKey === a.url ? "Copied!" : "Copy orphan URL"}
+                      </button>
+                    </div>
+                    {linkFrom.length === 0 ? (
+                      <div style={{ fontSize: 11, color: C.textMuted, padding: "6px 0" }}>No strong related articles found to link from.</div>
+                    ) : linkFrom.map((s) => {
+                      const sfd = fmtDate(s.modified);
+                      return (
+                        <div key={s.url} style={{ display: "grid", gridTemplateColumns: "1fr 70px 90px 70px", alignItems: "center", gap: 8, padding: "6px 0", borderBottom: `1px solid ${C.border}` }}>
+                          <div style={{ minWidth: 0 }}>
+                            <div style={{ fontSize: 12, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{s.title}</div>
+                            <div style={{ fontSize: 9, color: C.textMuted, fontFamily: "monospace", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{shortUrl(s.url)}{sfd ? `  ·  ↻ ${sfd.label}` : ""}</div>
+                          </div>
+                          <div style={{ textAlign: "right", fontSize: 11, color: C.textSecondary, fontVariantNumeric: "tabular-nums" }}>{s.sessions > 0 ? fmt(s.sessions) : "—"}</div>
+                          <div style={{ display: "flex", justifyContent: "center" }}><ScorePill score={s.rel} /></div>
+                          <div style={{ display: "flex", justifyContent: "center" }}>
+                            <button onClick={() => copyUrl(s)}
+                              style={{ padding: "4px 8px", borderRadius: 5, border: `1px solid ${C.border}`,
+                                background: copiedKey === s.url ? C.greenLight : C.surface, color: copiedKey === s.url ? C.green : C.textSecondary,
+                                fontSize: 10, cursor: "pointer", fontFamily: "inherit", fontWeight: 600, whiteSpace: "nowrap" }}>
+                              {copiedKey === s.url ? "Copied!" : "Copy"}
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </>
+  );
+}
+
 function TSLInternalLinker() {
   // Baked-in baseline (from public/linkdata.json)
   const [baseline, setBaseline] = useState({ articles: [], meta: null });
@@ -499,6 +676,7 @@ function TSLInternalLinker() {
   const [sortBy, setSortBy] = useState("score");
   const [topN, setTopN] = useState(10);
   const [copiedKey, setCopiedKey] = useState(null);
+  const [view, setView] = useState("find"); // "find" | "orphans"
 
   const debouncedQuery = useDebounce(sourceQuery, 200);
 
@@ -570,7 +748,9 @@ function TSLInternalLinker() {
         // Latest-modified-date wins: skip an upload that's older than what's
         // already there (same safeguard as the build script).
         if (existing && existing.d && a.d && a.d < existing.d) continue;
-        map.set(key, { ...a, s: existing ? existing.s : 0 }); // keep baked sessions on upsert
+        // Keep baked sessions, and keep the baseline link graph if the upload
+        // (which isn't link-parsed) doesn't carry one.
+        map.set(key, { ...a, s: existing ? existing.s : 0, lo: a.lo ?? existing?.lo });
       }
     const addSess = new Map();
     for (const src of ga4Sources)
@@ -585,8 +765,9 @@ function TSLInternalLinker() {
       for (const [t, n] of a.ct || []) bag.set(t, (bag.get(t) || 0) + n);
       let dl = 0;
       for (const v of bag.values()) dl += v;
-      articles.push({ title: a.t, url: a.u, keyword: a.k || "", category: a.c || "", modified: a.d || "", sessions, bag, dl });
+      articles.push({ title: a.t, url: a.u, keyword: a.k || "", category: a.c || "", modified: a.d || "", sessions, bag, dl, lo: a.lo || [] });
     }
+    articles.forEach((a, i) => { a.idx = i; });
 
     const N = articles.length || 1;
     let totalDl = 0;
@@ -612,11 +793,17 @@ function TSLInternalLinker() {
     const denom = N - 1 || 1;
     for (const a of articles) a.trafficWeight = a.sessions > 0 ? lowerCount(a.sessions) / denom : 0;
 
-    return { articles, inverted, N, avgdl };
+    // Internal link graph: invert outbound (lo) into inbound adjacency, so each
+    // article knows who links to it (orphan = nobody does).
+    const inboundAdj = articles.map(() => []);
+    articles.forEach((a, i) => { for (const j of a.lo) if (inboundAdj[j]) inboundAdj[j].push(i); });
+    articles.forEach((a, i) => { a.inbound = inboundAdj[i].length; });
+
+    return { articles, inverted, N, avgdl, inboundAdj };
   }, [baseline, indexSources, ga4Sources]);
 
   const suggestions = useMemo(() => {
-    const { articles, inverted, N, avgdl } = dataset;
+    const { articles } = dataset;
     if (!articles.length) return [];
     const srcUrlNorm = normUrl(sourceUrl);
     // Query terms from the topic text + the URL slug (last path segment).
@@ -629,18 +816,7 @@ function TSLInternalLinker() {
     if (!q.length) return [];
 
     // BM25: only docs sharing a query term are scored (via the inverted index).
-    const bm = new Map();
-    for (const t of q) {
-      const postings = inverted.get(t);
-      if (!postings) continue;
-      const df = postings.length;
-      const idf = Math.log(1 + (N - df + 0.5) / (df + 0.5));
-      for (const [i, wtf] of postings) {
-        const a = articles[i];
-        const score = idf * (wtf * (BM25_K1 + 1)) / (wtf + BM25_K1 * (1 - BM25_B + BM25_B * (a.dl / avgdl)));
-        bm.set(i, (bm.get(i) || 0) + score);
-      }
-    }
+    const bm = bm25Scores(dataset, q);
     if (!bm.size) return [];
 
     let maxBm = 0;
@@ -716,6 +892,24 @@ function TSLInternalLinker() {
                 : <span style={{ color: C.orange, fontWeight: 600 }}>⚠ No GA4 data</span>}
             </div>
           )}
+        </div>
+      </div>
+
+      {/* Tabs */}
+      <div style={{ background: C.surface, borderBottom: `1px solid ${C.border}`, padding: "0 24px" }}>
+        <div style={{ maxWidth: 980, margin: "0 auto", display: "flex", gap: 4 }}>
+          {[
+            ["find", "🔗 Find links"],
+            ["orphans", `🕸 Orphans${baseline.meta?.orphanCount ? ` · ${fmt(baseline.meta.orphanCount)}` : ""}`],
+          ].map(([v, label]) => (
+            <button key={v} onClick={() => setView(v)}
+              style={{ padding: "11px 14px", border: "none", background: "transparent", cursor: "pointer",
+                fontFamily: "inherit", fontSize: 13, fontWeight: view === v ? 700 : 500,
+                color: view === v ? C.red : C.textSecondary,
+                borderBottom: `2px solid ${view === v ? C.red : "transparent"}`, marginBottom: -1 }}>
+              {label}
+            </button>
+          ))}
         </div>
       </div>
 
@@ -815,6 +1009,17 @@ function TSLInternalLinker() {
           </div>
         )}
 
+        {view === "orphans" && (hasData
+          ? <OrphanView dataset={dataset} copyUrl={copyUrl} copiedKey={copiedKey} />
+          : baselineState !== "loading" && (
+            <div style={{ textAlign: "center", padding: "48px 24px", color: C.textSecondary, fontSize: 13, background: C.surface, borderRadius: 8, border: `1px solid ${C.border}` }}>
+              <div style={{ fontSize: 28, marginBottom: 12 }}>🕸</div>
+              <div style={{ fontWeight: 600, color: C.textPrimary, marginBottom: 6 }}>No article data loaded yet</div>
+              <div>Load the article index (run <code>npm run build-data</code> or add a CSV above) to find orphaned articles.</div>
+            </div>
+          ))}
+
+        {view === "find" && <>
         {/* Source article inputs */}
         <div style={{ background: C.surface, borderRadius: 8, border: `1px solid ${C.border}`, padding: "18px 20px", marginBottom: 16 }}>
           <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 14 }}>Source article</div>
@@ -945,6 +1150,7 @@ function TSLInternalLinker() {
             {monthsCovered.length > 0 && <> · <b style={{ color: C.textSecondary }}>Traffic</b> = cumulative sessions across {monthsCovered.join(", ")}.</>}
           </div>
         )}
+        </>}
       </div>
     </div>
   );

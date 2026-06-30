@@ -19,7 +19,7 @@ import { readdirSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  streamCSV, normaliseUrl, termFreq, decodeEntities,
+  streamCSV, normaliseUrl, termFreq, decodeEntities, extractInternalLinks,
   getTitle, getUrl, getKeyword, getCategory, getContent,
   getPath, getSessions, getModified, toISODate, labelFromName,
 } from "./shared.mjs";
@@ -53,11 +53,13 @@ for (const f of csvFiles(INDEX_DIR)) {
     if (prev && prev.d && d && d < prev.d) return;
     const keyword = decodeEntities(getKeyword(r));
     const category = decodeEntities(getCategory(r));
+    const content = getContent(r);
     // tt = strong field (title + focus keyword); ct = body (content + category).
     // Each is [stem, count] pairs for BM25 term-frequency scoring.
     const tt = termFreq(`${title} ${keyword}`);
-    const ct = termFreq(`${getContent(r)} ${category}`, CONTENT_TOKEN_CAP);
-    articles.set(key, { t: title, u: url, k: keyword, c: category, d, tt, ct });
+    const ct = termFreq(`${content} ${category}`, CONTENT_TOKEN_CAP);
+    const out = extractInternalLinks(content); // outbound internal links (normalised)
+    articles.set(key, { t: title, u: url, k: keyword, c: category, d, tt, ct, out });
     added++;
   });
   console.log(`  index  ${f.padEnd(34)} ${added.toLocaleString()} rows  (${label})`);
@@ -82,14 +84,32 @@ for (const f of csvFiles(GA4_DIR)) {
   console.log(`  ga4    ${f.padEnd(34)} ${monthSessions.toLocaleString()} sessions  (${label})`);
 }
 
-// ---- 3. Attach sessions + assemble -----------------------------------------
+// ---- 3. Resolve link graph + attach sessions + assemble --------------------
+// lo = outbound internal-link targets as indices into this article set. Inbound
+// counts (for orphan detection) are derived from lo at load time.
+const entries = [...articles.entries()]; // [normUrl, a] in insertion order
+const idxByKey = new Map();
+entries.forEach(([key], i) => idxByKey.set(key, i));
+
 const out = [];
 let withTraffic = 0;
-for (const [key, a] of articles) {
+let totalLinks = 0;
+const inboundCount = new Array(entries.length).fill(0);
+for (let i = 0; i < entries.length; i++) {
+  const [key, a] = entries[i];
   const sessions = sessionsByUrl.get(key) || 0;
   if (sessions > 0) withTraffic++;
-  out.push({ ...a, s: sessions });
+  const lo = [];
+  const seen = new Set();
+  for (const t of a.out || []) {
+    const j = idxByKey.get(t);
+    if (j === undefined || j === i || seen.has(j)) continue;
+    seen.add(j); lo.push(j); inboundCount[j]++; totalLinks++;
+  }
+  out.push({ t: a.t, u: a.u, k: a.k, c: a.c, d: a.d, s: sessions, tt: a.tt, ct: a.ct, lo });
 }
+const orphanCount = inboundCount.filter((c) => c === 0).length;
+const weakCount = inboundCount.filter((c) => c > 0 && c <= 2).length;
 
 if (!existsSync(dirname(OUT))) mkdirSync(dirname(OUT), { recursive: true });
 const payload = {
@@ -98,6 +118,9 @@ const payload = {
     articleCount: out.length,
     withTraffic,
     totalSessions,
+    totalLinks,
+    orphanCount,
+    weakCount,
     indexMonths,
     ga4Months,
   },
@@ -109,4 +132,5 @@ writeFileSync(OUT, json);
 const sizeMB = (Buffer.byteLength(json) / (1024 * 1024)).toFixed(2);
 console.log(`\n✓ Wrote ${OUT}`);
 console.log(`  ${out.length.toLocaleString()} articles · ${withTraffic.toLocaleString()} with traffic · ${totalSessions.toLocaleString()} total sessions · ${sizeMB} MB`);
+console.log(`  link graph: ${totalLinks.toLocaleString()} internal links · ${orphanCount.toLocaleString()} orphans (0 inbound) · ${weakCount.toLocaleString()} weak (1–2 inbound)`);
 if (!out.length) console.log("  (no data found — drop CSVs into data/index and data/ga4, then re-run)");

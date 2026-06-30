@@ -123,6 +123,28 @@ export function normaliseUrl(raw) {
   return u;
 }
 
+// Extract distinct internal-link targets (normalised paths) from post HTML.
+// Only links to thesmartlocal.com or root-relative paths count — this builds the
+// internal link graph used for orphan detection.
+export function extractInternalLinks(html) {
+  if (!html) return [];
+  const out = new Set();
+  const re = /<a\b[^>]*\bhref\s*=\s*["']([^"']+)["']/gi;
+  let m;
+  while ((m = re.exec(html))) {
+    const href = m[1].trim();
+    if (!href || href[0] === "#" || href.startsWith("mailto:") || href.startsWith("tel:")) continue;
+    const internal =
+      (href[0] === "/" && href[1] !== "/") ||
+      /^https?:\/\/(www\.)?thesmartlocal\.com/i.test(href) ||
+      /^\/\/(www\.)?thesmartlocal\.com/i.test(href);
+    if (!internal) continue;
+    const n = normaliseUrl(href.replace(/^\/\//, "https://"));
+    if (n) out.add(n);
+  }
+  return [...out];
+}
+
 // Streaming CSV parser — feeds rows to `onRow(obj)` one at a time without ever
 // holding the whole file (or all its rows) in memory. Handles quoted fields with
 // embedded commas/newlines, and "" escapes that straddle chunk boundaries.
