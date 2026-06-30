@@ -19,9 +19,9 @@ import { readdirSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  streamCSV, normaliseUrl, uniqueTokens,
+  streamCSV, normaliseUrl, termFreq, decodeEntities,
   getTitle, getUrl, getKeyword, getCategory, getContent,
-  getPath, getSessions, labelFromName,
+  getPath, getSessions, getModified, toISODate, labelFromName,
 } from "./shared.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -29,7 +29,7 @@ const INDEX_DIR = join(ROOT, "data", "index");
 const GA4_DIR = join(ROOT, "data", "ga4");
 const OUT = join(ROOT, "public", "linkdata.json");
 
-const CONTENT_TOKEN_CAP = 250; // unique content tokens kept per article
+const CONTENT_TOKEN_CAP = 200; // top content terms (by frequency) kept per article
 
 const csvFiles = (dir) =>
   existsSync(dir) ? readdirSync(dir).filter((f) => f.toLowerCase().endsWith(".csv")).sort() : [];
@@ -42,12 +42,22 @@ for (const f of csvFiles(INDEX_DIR)) {
   indexMonths.push(label);
   let added = 0;
   await streamCSV(join(INDEX_DIR, f), (r) => {
-    const url = getUrl(r), title = getTitle(r);
+    const url = getUrl(r);
+    const title = decodeEntities(getTitle(r));
     if (!url || !title) return;
-    const tt = uniqueTokens(`${title} ${getKeyword(r)} ${getCategory(r)}`);
-    const ttSet = new Set(tt);
-    const ct = uniqueTokens(getContent(r), CONTENT_TOKEN_CAP).filter((t) => !ttSet.has(t));
-    articles.set(normaliseUrl(url), { t: title, u: url, k: getKeyword(r), c: getCategory(r), tt, ct });
+    const key = normaliseUrl(url);
+    const d = toISODate(getModified(r));
+    // Collision safeguard: if this URL already exists with a newer modified
+    // date, keep the existing (fresher) row — deterministic across import order.
+    const prev = articles.get(key);
+    if (prev && prev.d && d && d < prev.d) return;
+    const keyword = decodeEntities(getKeyword(r));
+    const category = decodeEntities(getCategory(r));
+    // tt = strong field (title + focus keyword); ct = body (content + category).
+    // Each is [stem, count] pairs for BM25 term-frequency scoring.
+    const tt = termFreq(`${title} ${keyword}`);
+    const ct = termFreq(`${getContent(r)} ${category}`, CONTENT_TOKEN_CAP);
+    articles.set(key, { t: title, u: url, k: keyword, c: category, d, tt, ct });
     added++;
   });
   console.log(`  index  ${f.padEnd(34)} ${added.toLocaleString()} rows  (${label})`);

@@ -18,6 +18,76 @@ export const STOPWORDS = new Set([
   "target","blank","strong","html","body","head","li","ul","ol","br","px",
 ]);
 
+// Porter stemmer (M.F. Porter, 1980) — collapses inflections so a query for
+// "hotel" matches "hotels", "cafe"↔"cafes", "review"↔"reviews", etc. Compact
+// public-domain JS port. MUST stay identical to the copy in src/App.jsx.
+export function stem(w) {
+  const step2 = { ational:"ate",tional:"tion",enci:"ence",anci:"ance",izer:"ize",bli:"ble",alli:"al",entli:"ent",eli:"e",ousli:"ous",ization:"ize",ation:"ate",ator:"ate",alism:"al",iveness:"ive",fulness:"ful",ousness:"ous",aliti:"al",iviti:"ive",biliti:"ble",logi:"log" };
+  const step3 = { icate:"ic",ative:"",alize:"al",iciti:"ic",ical:"ic",ful:"",ness:"" };
+  const cc = "[^aeiou]", vv = "[aeiouy]", Cc = cc + "[^aeiouy]*", Vv = vv + "[aeiou]*";
+  const mgr0 = "^(" + Cc + ")?" + Vv + Cc;
+  const meq1 = "^(" + Cc + ")?" + Vv + Cc + "(" + Vv + ")?$";
+  const mgr1 = "^(" + Cc + ")?" + Vv + Cc + Vv + Cc;
+  const s_v = "^(" + Cc + ")?" + vv;
+  if (w.length < 3) return w;
+  let re, re2, re3, re4, fp, st, suf;
+  const first = w[0];
+  if (first === "y") w = "Y" + w.substr(1);
+  re = /^(.+?)(ss|i)es$/; re2 = /^(.+?)([^s])s$/;
+  if (re.test(w)) w = w.replace(re, "$1$2");
+  else if (re2.test(w)) w = w.replace(re2, "$1$2");
+  re = /^(.+?)eed$/; re2 = /^(.+?)(ed|ing)$/;
+  if (re.test(w)) { fp = re.exec(w); if (new RegExp(mgr0).test(fp[1])) w = w.replace(/.$/, ""); }
+  else if (re2.test(w)) {
+    fp = re2.exec(w); st = fp[1];
+    if (new RegExp(s_v).test(st)) {
+      w = st;
+      if (/(at|bl|iz)$/.test(w)) w += "e";
+      else if (/([^aeiouylsz])\1$/.test(w)) w = w.replace(/.$/, "");
+      else if (new RegExp("^" + Cc + vv + "[^aeiouwxy]$").test(w)) w += "e";
+    }
+  }
+  re = /^(.+?)y$/;
+  if (re.test(w)) { fp = re.exec(w); if (new RegExp(s_v).test(fp[1])) w = fp[1] + "i"; }
+  re = /^(.+?)(ational|tional|enci|anci|izer|bli|alli|entli|eli|ousli|ization|ation|ator|alism|iveness|fulness|ousness|aliti|iviti|biliti|logi)$/;
+  if (re.test(w)) { fp = re.exec(w); if (new RegExp(mgr0).test(fp[1])) w = fp[1] + step2[fp[2]]; }
+  re = /^(.+?)(icate|ative|alize|iciti|ical|ful|ness)$/;
+  if (re.test(w)) { fp = re.exec(w); if (new RegExp(mgr0).test(fp[1])) w = fp[1] + step3[fp[2]]; }
+  re = /^(.+?)(al|ance|ence|er|ic|able|ible|ant|ement|ment|ent|ou|ism|ate|iti|ous|ive|ize)$/; re2 = /^(.+?)(s|t)(ion)$/;
+  if (re.test(w)) { fp = re.exec(w); if (new RegExp(mgr1).test(fp[1])) w = fp[1]; }
+  else if (re2.test(w)) { fp = re2.exec(w); st = fp[1] + fp[2]; if (new RegExp(mgr1).test(st)) w = st; }
+  re = /^(.+?)e$/;
+  if (re.test(w)) { fp = re.exec(w); st = fp[1]; re2 = new RegExp(meq1); re3 = new RegExp("^" + Cc + vv + "[^aeiouwxy]$"); if (new RegExp(mgr1).test(st) || (re2.test(st) && !re3.test(st))) w = st; }
+  if (/ll$/.test(w) && new RegExp(mgr1).test(w)) w = w.replace(/.$/, "");
+  if (first === "y") w = "y" + w.substr(1);
+  return w;
+}
+
+// Decode HTML entities from WordPress exports (&#038; -> &, &nbsp; -> space,
+// &#8217; -> ’, etc.) so titles render as real text. Pure-JS (no DOM) so it
+// works in both Node (build) and the browser. Mirror of the copy in App.jsx.
+const NAMED_ENTITIES = {
+  amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ",
+  ndash: "–", mdash: "—", hellip: "…", rsquo: "’", lsquo: "‘",
+  rdquo: "”", ldquo: "“", copy: "©", reg: "®", trade: "™", deg: "°",
+  eacute: "é", egrave: "è", agrave: "à", ccedil: "ç",
+};
+export function decodeEntities(str) {
+  if (!str) return str;
+  return str
+    .replace(/&(#x?[0-9a-f]+|[a-z]+[0-9]*);/gi, (m, e) => {
+      if (e[0] === "#") {
+        const cp = (e[1] === "x" || e[1] === "X")
+          ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
+        return Number.isFinite(cp) ? String.fromCodePoint(cp) : m;
+      }
+      const k = e.toLowerCase();
+      return Object.prototype.hasOwnProperty.call(NAMED_ENTITIES, k) ? NAMED_ENTITIES[k] : m;
+    })
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 export function tokenise(str) {
   return (str || "")
     .toLowerCase()
@@ -25,16 +95,20 @@ export function tokenise(str) {
     .replace(/&[a-z]+;/g, " ")     // strip html entities (&nbsp; etc.)
     .replace(/[^\w\s]/g, " ")
     .split(/\s+/)
-    .filter((w) => w.length > 2 && !STOPWORDS.has(w));
+    // keep 2-char tokens — "jb", "sg", "kl", "hk" are core TSL terms; generic
+    // 2-letter words are already stopwords.
+    .filter((w) => w.length >= 2 && !STOPWORDS.has(w))
+    .map(stem);
 }
 
-export function uniqueTokens(str, cap) {
-  const seen = new Set();
-  for (const t of tokenise(str)) {
-    seen.add(t);
-    if (cap && seen.size >= cap) break;
-  }
-  return [...seen];
+// Term frequencies as [stem, count] pairs, sorted by count desc, capped.
+// BM25 needs counts (a hotel listicle naming "hotel" 8× should outrank a
+// review that mentions it once), so we keep frequency rather than a unique set.
+export function termFreq(str, cap) {
+  const counts = new Map();
+  for (const t of tokenise(str)) counts.set(t, (counts.get(t) || 0) + 1);
+  const pairs = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  return cap ? pairs.slice(0, cap) : pairs;
 }
 
 export function normaliseUrl(raw) {
@@ -188,6 +262,19 @@ export const getSessions = (r) => {
   const v = pick(r, ["sessions", "views", "page views", "pageviews", "screen page views", "active users", "users", "total users"]);
   return parseInt(String(v).replace(/[^\d]/g, ""), 10) || 0;
 };
+// Last-modified date drives the freshness signal + URL-collision tiebreak.
+export const getModified = (r) =>
+  pick(r, ["post modified date", "modified", "post modified", "last modified", "modified date", "date modified", "updated"]);
+
+// Normalise a date string to ISO "YYYY-MM-DD" (lexically sortable) or "".
+export function toISODate(str) {
+  if (!str) return "";
+  const s = String(str).trim();
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+  const t = Date.parse(s);
+  return Number.isNaN(t) ? "" : new Date(t).toISOString().slice(0, 10);
+}
 
 // Derive a human label like "Mar 2026" / "2026-03" from a filename.
 const MONTHS = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"];

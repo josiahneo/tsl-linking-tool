@@ -32,6 +32,75 @@ const STOPWORDS = new Set([
   "target","blank","strong","html","body","head","li","ul","ol","br","px","read",
 ]);
 
+// Porter stemmer (M.F. Porter, 1980) — collapses inflections so "hotel" matches
+// "hotels", "cafe"↔"cafes", etc. MUST stay identical to the copy in
+// scripts/shared.mjs so baked data and in-browser uploads/queries align.
+function stem(w) {
+  const step2 = { ational:"ate",tional:"tion",enci:"ence",anci:"ance",izer:"ize",bli:"ble",alli:"al",entli:"ent",eli:"e",ousli:"ous",ization:"ize",ation:"ate",ator:"ate",alism:"al",iveness:"ive",fulness:"ful",ousness:"ous",aliti:"al",iviti:"ive",biliti:"ble",logi:"log" };
+  const step3 = { icate:"ic",ative:"",alize:"al",iciti:"ic",ical:"ic",ful:"",ness:"" };
+  const cc = "[^aeiou]", vv = "[aeiouy]", Cc = cc + "[^aeiouy]*", Vv = vv + "[aeiou]*";
+  const mgr0 = "^(" + Cc + ")?" + Vv + Cc;
+  const meq1 = "^(" + Cc + ")?" + Vv + Cc + "(" + Vv + ")?$";
+  const mgr1 = "^(" + Cc + ")?" + Vv + Cc + Vv + Cc;
+  const s_v = "^(" + Cc + ")?" + vv;
+  if (w.length < 3) return w;
+  let re, re2, re3, fp, st;
+  const first = w[0];
+  if (first === "y") w = "Y" + w.substr(1);
+  re = /^(.+?)(ss|i)es$/; re2 = /^(.+?)([^s])s$/;
+  if (re.test(w)) w = w.replace(re, "$1$2");
+  else if (re2.test(w)) w = w.replace(re2, "$1$2");
+  re = /^(.+?)eed$/; re2 = /^(.+?)(ed|ing)$/;
+  if (re.test(w)) { fp = re.exec(w); if (new RegExp(mgr0).test(fp[1])) w = w.replace(/.$/, ""); }
+  else if (re2.test(w)) {
+    fp = re2.exec(w); st = fp[1];
+    if (new RegExp(s_v).test(st)) {
+      w = st;
+      if (/(at|bl|iz)$/.test(w)) w += "e";
+      else if (/([^aeiouylsz])\1$/.test(w)) w = w.replace(/.$/, "");
+      else if (new RegExp("^" + Cc + vv + "[^aeiouwxy]$").test(w)) w += "e";
+    }
+  }
+  re = /^(.+?)y$/;
+  if (re.test(w)) { fp = re.exec(w); if (new RegExp(s_v).test(fp[1])) w = fp[1] + "i"; }
+  re = /^(.+?)(ational|tional|enci|anci|izer|bli|alli|entli|eli|ousli|ization|ation|ator|alism|iveness|fulness|ousness|aliti|iviti|biliti|logi)$/;
+  if (re.test(w)) { fp = re.exec(w); if (new RegExp(mgr0).test(fp[1])) w = fp[1] + step2[fp[2]]; }
+  re = /^(.+?)(icate|ative|alize|iciti|ical|ful|ness)$/;
+  if (re.test(w)) { fp = re.exec(w); if (new RegExp(mgr0).test(fp[1])) w = fp[1] + step3[fp[2]]; }
+  re = /^(.+?)(al|ance|ence|er|ic|able|ible|ant|ement|ment|ent|ou|ism|ate|iti|ous|ive|ize)$/; re2 = /^(.+?)(s|t)(ion)$/;
+  if (re.test(w)) { fp = re.exec(w); if (new RegExp(mgr1).test(fp[1])) w = fp[1]; }
+  else if (re2.test(w)) { fp = re2.exec(w); st = fp[1] + fp[2]; if (new RegExp(mgr1).test(st)) w = st; }
+  re = /^(.+?)e$/;
+  if (re.test(w)) { fp = re.exec(w); st = fp[1]; re2 = new RegExp(meq1); re3 = new RegExp("^" + Cc + vv + "[^aeiouwxy]$"); if (new RegExp(mgr1).test(st) || (re2.test(st) && !re3.test(st))) w = st; }
+  if (/ll$/.test(w) && new RegExp(mgr1).test(w)) w = w.replace(/.$/, "");
+  if (first === "y") w = "y" + w.substr(1);
+  return w;
+}
+
+// Decode WordPress HTML entities (&#038; -> &, &nbsp; -> space) so titles render
+// as real text. Mirror of the copy in scripts/shared.mjs.
+const NAMED_ENTITIES = {
+  amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ",
+  ndash: "–", mdash: "—", hellip: "…", rsquo: "’", lsquo: "‘",
+  rdquo: "”", ldquo: "“", copy: "©", reg: "®", trade: "™", deg: "°",
+  eacute: "é", egrave: "è", agrave: "à", ccedil: "ç",
+};
+function decodeEntities(str) {
+  if (!str) return str;
+  return str
+    .replace(/&(#x?[0-9a-f]+|[a-z]+[0-9]*);/gi, (m, e) => {
+      if (e[0] === "#") {
+        const cp = (e[1] === "x" || e[1] === "X")
+          ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
+        return Number.isFinite(cp) ? String.fromCodePoint(cp) : m;
+      }
+      const k = e.toLowerCase();
+      return Object.prototype.hasOwnProperty.call(NAMED_ENTITIES, k) ? NAMED_ENTITIES[k] : m;
+    })
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function tokenise(str) {
   return (str || "")
     .toLowerCase()
@@ -39,17 +108,25 @@ function tokenise(str) {
     .replace(/&[a-z]+;/g, " ")
     .replace(/[^\w\s]/g, " ")
     .split(/\s+/)
-    .filter((w) => w.length > 2 && !STOPWORDS.has(w));
+    // keep 2-char tokens — "jb", "sg", "kl", "hk" are core TSL terms; generic
+    // 2-letter words are already stopwords.
+    .filter((w) => w.length >= 2 && !STOPWORDS.has(w))
+    .map(stem);
 }
 
-function uniqueTokens(str, cap) {
-  const seen = new Set();
-  for (const t of tokenise(str)) {
-    seen.add(t);
-    if (cap && seen.size >= cap) break;
-  }
-  return [...seen];
+// Term frequencies as [stem, count] pairs, sorted by count desc, capped.
+function termFreq(str, cap) {
+  const counts = new Map();
+  for (const t of tokenise(str)) counts.set(t, (counts.get(t) || 0) + 1);
+  const pairs = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  return cap ? pairs.slice(0, cap) : pairs;
 }
+
+// BM25 + ranking tunables (tweak freely — no rebuild needed).
+const BM25_K1 = 1.5;       // term-frequency saturation
+const BM25_B = 0.6;        // length normalisation
+const TITLE_BOOST = 3.0;   // weight of title/keyword hits vs body
+const TRAFFIC_ALPHA = 0.3; // max relative lift from traffic (gentle re-rank)
 
 function normUrl(raw) {
   if (!raw) return "";
@@ -135,8 +212,18 @@ const getSessions = (r) => {
   const v = pick(r, ["sessions", "views", "page views", "pageviews", "screen page views", "active users", "users", "total users"]);
   return parseInt(String(v).replace(/[^\d]/g, ""), 10) || 0;
 };
+const getModified = (r) =>
+  pick(r, ["post modified date", "modified", "post modified", "last modified", "modified date", "date modified", "updated"]);
+function toISODate(str) {
+  if (!str) return "";
+  const s = String(str).trim();
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+  const t = Date.parse(s);
+  return Number.isNaN(t) ? "" : new Date(t).toISOString().slice(0, 10);
+}
 
-const CONTENT_TOKEN_CAP = 250;
+const CONTENT_TOKEN_CAP = 200;
 const MONTHS = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"];
 const MONTH_FULL = ["january","february","march","april","may","june","july","august","september","october","november","december"];
 function labelFromName(name) {
@@ -190,6 +277,18 @@ function fmtBytes(b) {
 }
 function shortUrl(url) {
   return url.replace(/^https?:\/\/(www\.)?thesmartlocal\.com/, "").replace(/\/$/, "") || "/";
+}
+// "Sep 2024" + a freshness colour (green <1y, muted <2y, orange older) so stale
+// content stands out as a refresh candidate.
+const MONTHS_SHORT = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+function fmtDate(iso) {
+  if (!iso) return null;
+  const [y, m] = iso.split("-");
+  const label = `${MONTHS_SHORT[(+m || 1) - 1]} ${y}`;
+  const ageMs = Date.now() - new Date(iso).getTime();
+  const yrs = ageMs / (365.25 * 24 * 3600 * 1000);
+  const color = yrs < 1 ? C.green : yrs < 2 ? C.textMuted : C.orange;
+  return { label, color };
 }
 function useDebounce(value, ms) {
   const [v, setV] = useState(value);
@@ -420,12 +519,14 @@ function TSLInternalLinker() {
   const addIndex = useCallback((text, name) => {
     const rows = parseCSV(text);
     const articles = rows.map((r) => {
-      const title = getTitle(r), url = getUrl(r);
+      const url = getUrl(r);
+      const title = decodeEntities(getTitle(r));
+      const keyword = decodeEntities(getKeyword(r));
+      const category = decodeEntities(getCategory(r));
       if (!title || !url) return null;
-      const tt = uniqueTokens(`${title} ${getKeyword(r)} ${getCategory(r)}`);
-      const ttSet = new Set(tt);
-      const ct = uniqueTokens(getContent(r), CONTENT_TOKEN_CAP).filter((t) => !ttSet.has(t));
-      return { t: title, u: url, k: getKeyword(r), c: getCategory(r), tt, ct };
+      const tt = termFreq(`${title} ${keyword}`);
+      const ct = termFreq(`${getContent(r)} ${category}`, CONTENT_TOKEN_CAP);
+      return { t: title, u: url, k: keyword, c: category, d: toISODate(getModified(r)), tt, ct };
     }).filter(Boolean);
     if (!articles.length) return;
     setIndexSources((prev) => [...prev, {
@@ -456,7 +557,9 @@ function TSLInternalLinker() {
   const removeSource = (setter) => (id) =>
     setter((prev) => prev.filter((s) => s.id !== id));
 
-  // Merge baseline + uploads, sum sessions, build inverted indexes (cached).
+  // Merge baseline + uploads, then build the BM25 search structures (cached):
+  // per-doc weighted term-frequency bag, an inverted index, avg doc length, and
+  // a percentile traffic weight (robust to the 6M-view homepage outlier).
   const dataset = useMemo(() => {
     const map = new Map();
     for (const a of baseline.articles) map.set(normUrl(a.u), { ...a });
@@ -464,6 +567,9 @@ function TSLInternalLinker() {
       for (const a of src.articles) {
         const key = normUrl(a.u);
         const existing = map.get(key);
+        // Latest-modified-date wins: skip an upload that's older than what's
+        // already there (same safeguard as the build script).
+        if (existing && existing.d && a.d && a.d < existing.d) continue;
         map.set(key, { ...a, s: existing ? existing.s : 0 }); // keep baked sessions on upsert
       }
     const addSess = new Map();
@@ -473,28 +579,47 @@ function TSLInternalLinker() {
     const articles = [];
     for (const [key, a] of map) {
       const sessions = (a.s || 0) + (addSess.get(key) || 0);
-      articles.push({
-        title: a.t, url: a.u, keyword: a.k || "", category: a.c || "",
-        sessions, tt: a.tt || [], ct: a.ct || [],
-      });
+      // Weighted bag: title/keyword terms count TITLE_BOOST×, body terms 1×.
+      const bag = new Map();
+      for (const [t, n] of a.tt || []) bag.set(t, (bag.get(t) || 0) + n * TITLE_BOOST);
+      for (const [t, n] of a.ct || []) bag.set(t, (bag.get(t) || 0) + n);
+      let dl = 0;
+      for (const v of bag.values()) dl += v;
+      articles.push({ title: a.t, url: a.u, keyword: a.k || "", category: a.c || "", modified: a.d || "", sessions, bag, dl });
     }
-    let max = 1;
-    for (const a of articles) if (a.sessions > max) max = a.sessions;
-    const invTitle = new Map(), invContent = new Map();
-    const add = (m, t, i) => { const arr = m.get(t); if (arr) arr.push(i); else m.set(t, [i]); };
+
+    const N = articles.length || 1;
+    let totalDl = 0;
+    for (const a of articles) totalDl += a.dl;
+    const avgdl = totalDl / N || 1;
+
+    // Inverted index: token -> [[docIdx, weightedTf], ...]. df = postings length.
+    const inverted = new Map();
     articles.forEach((a, i) => {
-      a.trafficWeight = a.sessions / max;
-      for (const t of a.tt) add(invTitle, t, i);
-      for (const t of a.ct) add(invContent, t, i);
+      for (const [t, wtf] of a.bag) {
+        const p = inverted.get(t);
+        if (p) p.push([i, wtf]); else inverted.set(t, [[i, wtf]]);
+      }
     });
-    return { articles, invTitle, invContent };
+
+    // Percentile traffic weight: fraction of articles with fewer sessions.
+    const sorted = articles.map((a) => a.sessions).sort((x, y) => x - y);
+    const lowerCount = (s) => {
+      let lo = 0, hi = sorted.length;
+      while (lo < hi) { const m = (lo + hi) >> 1; if (sorted[m] < s) lo = m + 1; else hi = m; }
+      return lo;
+    };
+    const denom = N - 1 || 1;
+    for (const a of articles) a.trafficWeight = a.sessions > 0 ? lowerCount(a.sessions) / denom : 0;
+
+    return { articles, inverted, N, avgdl };
   }, [baseline, indexSources, ga4Sources]);
 
   const suggestions = useMemo(() => {
-    const { articles, invTitle, invContent } = dataset;
+    const { articles, inverted, N, avgdl } = dataset;
     if (!articles.length) return [];
     const srcUrlNorm = normUrl(sourceUrl);
-    // Query tokens from the topic text + the URL slug (last path segment).
+    // Query terms from the topic text + the URL slug (last path segment).
     let qText = debouncedQuery;
     if (sourceUrl) {
       const seg = normUrl(sourceUrl).split("/").filter(Boolean).pop() || "";
@@ -503,35 +628,53 @@ function TSLInternalLinker() {
     const q = [...new Set(tokenise(qText))];
     if (!q.length) return [];
 
-    const titleHits = new Map(), contentHits = new Map();
+    // BM25: only docs sharing a query term are scored (via the inverted index).
+    const bm = new Map();
     for (const t of q) {
-      const a = invTitle.get(t);
-      if (a) for (const i of a) titleHits.set(i, (titleHits.get(i) || 0) + 1);
-      const b = invContent.get(t);
-      if (b) for (const i of b) contentHits.set(i, (contentHits.get(i) || 0) + 1);
+      const postings = inverted.get(t);
+      if (!postings) continue;
+      const df = postings.length;
+      const idf = Math.log(1 + (N - df + 0.5) / (df + 0.5));
+      for (const [i, wtf] of postings) {
+        const a = articles[i];
+        const score = idf * (wtf * (BM25_K1 + 1)) / (wtf + BM25_K1 * (1 - BM25_B + BM25_B * (a.dl / avgdl)));
+        bm.set(i, (bm.get(i) || 0) + score);
+      }
     }
-    const candidates = new Set([...titleHits.keys(), ...contentHits.keys()]);
-    const qlen = q.length;
-    const res = [];
-    for (const i of candidates) {
+    if (!bm.size) return [];
+
+    let maxBm = 0;
+    for (const v of bm.values()) if (v > maxBm) maxBm = v;
+
+    const out = [];
+    for (const [i, score] of bm) {
       const a = articles[i];
       if (srcUrlNorm && normUrl(a.url) === srcUrlNorm) continue;
-      const th = titleHits.get(i) || 0, ch = contentHits.get(i) || 0;
-      const topical = Math.min(1, (th + 0.35 * ch) / qlen);
-      const combined = topical * 0.7 + (a.trafficWeight || 0) * 0.3;
-      if (combined * 100 < minScore) continue;
-      res.push({ ...a, topical, combined });
+      const tw = a.trafficWeight || 0;
+      // Relevance-first: traffic is a gentle multiplicative re-rank, never able
+      // to lift a weak match over a strong one.
+      const final = score * (1 + TRAFFIC_ALPHA * tw);
+      out.push({ ...a, rel: maxBm > 0 ? score / maxBm : 0, finalRaw: final, tw });
     }
-    res.sort((a, b) =>
-      sortBy === "traffic"
-        ? b.sessions - a.sessions || b.combined - a.combined
-        : b.combined - a.combined);
-    return res.slice(0, topN);
+    if (!out.length) return [];
+
+    let maxFinal = 0;
+    for (const o of out) if (o.finalRaw > maxFinal) maxFinal = o.finalRaw;
+    for (const o of out) o.combined = maxFinal > 0 ? o.finalRaw / maxFinal : 0; // 0–1 vs best match
+
+    return out
+      .filter((o) => o.combined * 100 >= minScore)
+      .sort((a, b) =>
+        sortBy === "traffic"
+          ? b.sessions - a.sessions || b.finalRaw - a.finalRaw
+          : b.finalRaw - a.finalRaw)
+      .slice(0, topN);
   }, [dataset, debouncedQuery, sourceUrl, minScore, sortBy, topN]);
 
-  const copyAnchor = (a) => {
-    const text = `<a href="${a.url}">${a.title}</a>`;
-    navigator.clipboard.writeText(text).then(() => {
+  // Copy the bare URL so writers paste the link and choose their own
+  // contextual anchor text (using the full headline as anchor is poor SEO).
+  const copyUrl = (a) => {
+    navigator.clipboard.writeText(a.url).then(() => {
       setCopiedKey(a.url);
       setTimeout(() => setCopiedKey(null), 1500);
     });
@@ -751,7 +894,10 @@ function TSLInternalLinker() {
                   <div style={{ minWidth: 0 }}>
                     <div style={{ fontSize: 13, fontWeight: 500, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{a.title}</div>
                     <div style={{ fontSize: 10, color: C.textMuted, marginTop: 2, fontFamily: "monospace", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{shortUrl(a.url)}</div>
-                    {a.keyword && <span style={{ display: "inline-block", fontSize: 9, fontWeight: 600, color: C.textSecondary, background: C.bg, border: `1px solid ${C.border}`, borderRadius: 3, padding: "1px 5px", marginTop: 3 }}>{a.keyword}</span>}
+                    <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 3, flexWrap: "wrap" }}>
+                      {a.keyword && <span style={{ display: "inline-block", fontSize: 9, fontWeight: 600, color: C.textSecondary, background: C.bg, border: `1px solid ${C.border}`, borderRadius: 3, padding: "1px 5px" }}>{a.keyword}</span>}
+                      {(() => { const fd = fmtDate(a.modified); return fd && <span style={{ fontSize: 9, fontWeight: 600, color: fd.color }}>↻ {fd.label}</span>; })()}
+                    </div>
                   </div>
                   <div style={{ textAlign: "right", fontSize: 12, fontWeight: 500, fontVariantNumeric: "tabular-nums", color: a.sessions > 0 ? C.textPrimary : C.textMuted }}>
                     {a.sessions > 0 ? fmt(a.sessions) : "—"}
@@ -761,15 +907,15 @@ function TSLInternalLinker() {
                   </div>
                   <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 3 }}>
                     <ScorePill score={a.combined} />
-                    <span style={{ fontSize: 9, color: C.textMuted }}>rel {Math.round(a.topical * 100)} · trfc {Math.round(a.trafficWeight * 100)}</span>
+                    <span style={{ fontSize: 9, color: C.textMuted }}>rel {Math.round(a.rel * 100)} · trfc {Math.round(a.trafficWeight * 100)}</span>
                   </div>
                   <div style={{ display: "flex", justifyContent: "center" }}>
-                    <button onClick={() => copyAnchor(a)}
+                    <button onClick={() => copyUrl(a)}
                       style={{ padding: "5px 10px", borderRadius: 5, border: `1px solid ${C.border}`,
                         background: copiedKey === a.url ? C.greenLight : C.bg,
                         color: copiedKey === a.url ? C.green : C.textSecondary,
                         fontSize: 11, cursor: "pointer", fontFamily: "inherit", fontWeight: 600, whiteSpace: "nowrap" }}>
-                      {copiedKey === a.url ? "Copied!" : "<a> copy"}
+                      {copiedKey === a.url ? "Copied!" : "Copy URL"}
                     </button>
                   </div>
                 </div>
@@ -795,7 +941,7 @@ function TSLInternalLinker() {
         )}
         {hasData && suggestions.length > 0 && (
           <div style={{ marginTop: 16, padding: "10px 14px", borderRadius: 6, background: C.bg, border: `1px solid ${C.border}`, fontSize: 10, color: C.textMuted, lineHeight: 1.8 }}>
-            <b style={{ color: C.textSecondary }}>Score</b> = 70% topical relevance + 30% traffic weight. Relevance weights title/keyword matches above body-content matches. · <b style={{ color: C.textSecondary }}>&lt;a&gt; copy</b> pastes a ready-to-use HTML anchor tag.
+            <b style={{ color: C.textSecondary }}>Score</b> = BM25 relevance (title/keyword weighted {TITLE_BOOST}× above body; generic words down-weighted by frequency), shown relative to the top match, with a gentle traffic re-rank. · <b style={{ color: C.textSecondary }}>Copy URL</b> copies the article link so you can write your own contextual anchor text.
             {monthsCovered.length > 0 && <> · <b style={{ color: C.textSecondary }}>Traffic</b> = cumulative sessions across {monthsCovered.join(", ")}.</>}
           </div>
         )}
