@@ -6,9 +6,13 @@
 // Run:  npm run build-data   ->   public/linkdata.json
 //
 // Merge rules:
-//   - index files dedupe by normalised URL; later files (newer months) win,
-//     so refreshed articles overwrite the older row.
-//   - GA4 sessions are SUMMED per URL across every file (cumulative traffic).
+//   - index files dedupe by WordPress post ID (falling back to normalised URL
+//     when the CSV has no ID column); the row with the newest modified date
+//     wins. A slug rename (fireworks-2025 -> fireworks-2026) therefore
+//     REPLACES the old row instead of duplicating it — the old URL is kept as
+//     an alias so its GA4 history and inbound links still credit the article.
+//   - GA4 sessions are SUMMED per URL across every file (cumulative traffic),
+//     then attributed to an article across its canonical URL + all aliases.
 //
 // Files are STREAMED row-by-row and each article is tokenised on the fly, so the
 // raw post content is never accumulated — memory stays flat even on a 200 MB CSV.
@@ -20,7 +24,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   streamCSV, normaliseUrl, termFreq, decodeEntities, extractInternalLinks,
-  getTitle, getUrl, getKeyword, getCategory, getContent,
+  getId, getStatus, getTitle, getUrl, getKeyword, getCategory, getContent,
   getPath, getSessions, getModified, toISODate, labelFromName,
 } from "./shared.mjs";
 
@@ -35,7 +39,8 @@ const csvFiles = (dir) =>
   existsSync(dir) ? readdirSync(dir).filter((f) => f.toLowerCase().endsWith(".csv")).sort() : [];
 
 // ---- 1. Merge article index files (tokenise inline, drop raw content) -------
-const articles = new Map(); // normUrl -> { t, u, k, c, tt, ct }
+const articles = new Map(); // stable key (id:<postID> | normUrl) -> row
+const keyByUrl = new Map(); // normUrl -> stable key, so ID-less rows still dedupe
 const indexMonths = [];
 for (const f of csvFiles(INDEX_DIR)) {
   const label = labelFromName(f) || f;
@@ -45,12 +50,24 @@ for (const f of csvFiles(INDEX_DIR)) {
     const url = getUrl(r);
     const title = decodeEntities(getTitle(r));
     if (!url || !title) return;
-    const key = normaliseUrl(url);
+    // Only live articles. Drafts/pending posts export a "?p=<id>" permalink
+    // that normalises to "/" — without this filter they'd pile up as bogus
+    // homepage articles (and previously one of them absorbed the homepage's
+    // GA4 sessions).
+    const status = getStatus(r).toLowerCase();
+    if (status && status !== "publish") return;
+    const nu = normaliseUrl(url);
+    if (nu === "/") return;
+    const id = getId(r);
+    const key = id ? `id:${id}` : keyByUrl.get(nu) || nu;
     const d = toISODate(getModified(r));
-    // Collision safeguard: if this URL already exists with a newer modified
-    // date, keep the existing (fresher) row — deterministic across import order.
     const prev = articles.get(key);
-    if (prev && prev.d && d && d < prev.d) return;
+    // Newest-modified-date wins — deterministic across import order. A losing
+    // row with a different URL is an outdated slug: keep it as an alias.
+    if (prev && prev.d && d && d < prev.d) {
+      if (nu !== prev.nu) { prev.al.add(nu); keyByUrl.set(nu, key); }
+      return;
+    }
     const keyword = decodeEntities(getKeyword(r));
     const category = decodeEntities(getCategory(r));
     const content = getContent(r);
@@ -59,7 +76,11 @@ for (const f of csvFiles(INDEX_DIR)) {
     const tt = termFreq(`${title} ${keyword}`);
     const ct = termFreq(`${content} ${category}`, CONTENT_TOKEN_CAP);
     const out = extractInternalLinks(content); // outbound internal links (normalised)
-    articles.set(key, { t: title, u: url, k: keyword, c: category, d, tt, ct, out });
+    const al = prev ? prev.al : new Set();
+    if (prev && prev.nu !== nu) al.add(prev.nu);
+    al.delete(nu);
+    articles.set(key, { id, t: title, u: url, nu, k: keyword, c: category, d, tt, ct, out, al });
+    keyByUrl.set(nu, key);
     added++;
   });
   console.log(`  index  ${f.padEnd(34)} ${added.toLocaleString()} rows  (${label})`);
@@ -87,26 +108,35 @@ for (const f of csvFiles(GA4_DIR)) {
 // ---- 3. Resolve link graph + attach sessions + assemble --------------------
 // lo = outbound internal-link targets as indices into this article set. Inbound
 // counts (for orphan detection) are derived from lo at load time.
-const entries = [...articles.entries()]; // [normUrl, a] in insertion order
-const idxByKey = new Map();
-entries.forEach(([key], i) => idxByKey.set(key, i));
+const entries = [...articles.values()]; // insertion order
+// URL -> article index, covering aliases too, so GA4 rows and internal links
+// that still use a pre-rename slug resolve to the renamed article.
+const idxByUrl = new Map();
+entries.forEach((a, i) => {
+  idxByUrl.set(a.nu, i);
+  for (const al of a.al) if (!idxByUrl.has(al)) idxByUrl.set(al, i);
+});
 
 const out = [];
 let withTraffic = 0;
 let totalLinks = 0;
 const inboundCount = new Array(entries.length).fill(0);
 for (let i = 0; i < entries.length; i++) {
-  const [key, a] = entries[i];
-  const sessions = sessionsByUrl.get(key) || 0;
+  const a = entries[i];
+  let sessions = sessionsByUrl.get(a.nu) || 0;
+  for (const al of a.al) sessions += sessionsByUrl.get(al) || 0;
   if (sessions > 0) withTraffic++;
   const lo = [];
   const seen = new Set();
   for (const t of a.out || []) {
-    const j = idxByKey.get(t);
+    const j = idxByUrl.get(t);
     if (j === undefined || j === i || seen.has(j)) continue;
     seen.add(j); lo.push(j); inboundCount[j]++; totalLinks++;
   }
-  out.push({ t: a.t, u: a.u, k: a.k, c: a.c, d: a.d, s: sessions, tt: a.tt, ct: a.ct, lo });
+  out.push({
+    t: a.t, u: a.u, k: a.k, c: a.c, d: a.d, s: sessions, tt: a.tt, ct: a.ct, lo,
+    ...(a.id ? { i: a.id } : {}), ...(a.al.size ? { al: [...a.al] } : {}),
+  });
 }
 const orphanCount = inboundCount.filter((c) => c === 0).length;
 const weakCount = inboundCount.filter((c) => c > 0 && c <= 2).length;

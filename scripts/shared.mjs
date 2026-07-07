@@ -255,6 +255,11 @@ const pick = (row, keys) => {
   return "";
 };
 
+// Stable article identity: the WordPress post ID survives slug renames
+// (fireworks-2025 -> fireworks-2026) and headline rewrites, so it is the
+// dedup key of choice; URL is only the fallback for ID-less CSVs.
+export const getId = (r) => pick(r, ["id", "post id", "post_id"]);
+export const getStatus = (r) => pick(r, ["status", "post status", "post_status"]);
 export const getTitle = (r) => pick(r, ["title", "page title", "article title", "post title", "name"]);
 export const getUrl = (r) => pick(r, ["url", "page url", "link", "permalink", "address"]);
 export const getKeyword = (r) => pick(r, ["keyword", "focus keyword", "focus keyphrase", "keyphrase"]);

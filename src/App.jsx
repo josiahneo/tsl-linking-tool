@@ -1,20 +1,47 @@
 import { useState, useCallback, useMemo, useRef, useEffect } from "react";
 
-const C = {
-  red: "#E8212B",
-  redLight: "#FDEAEA",
-  bg: "#F7F7F5",
-  surface: "#FFFFFF",
-  border: "#E2E2DE",
-  borderStrong: "#C8C8C2",
-  textPrimary: "#1A1A18",
-  textSecondary: "#6B6B65",
-  textMuted: "#9B9B95",
-  green: "#1A7A4A",
-  greenLight: "#EAF5EE",
-  orange: "#C96A00",
-  orangeLight: "#FFF3E0",
+// ---------------------------------------------------------------------------
+// Theme system — live design directions for the redesign. Each theme keeps the
+// same token keys, so every `C.*` usage works unchanged; switching is a mutate
+// + re-render. `C` is the active theme (starts on "current" for comparison).
+// ---------------------------------------------------------------------------
+const SYS_MONO = "ui-monospace,'SF Mono',Menlo,Consolas,monospace";
+const FONTS = {
+  inter: "'Inter','Helvetica Neue',Arial,sans-serif",
+  newsreader: "'Newsreader',Georgia,'Times New Roman',serif",
+  grotesk: "'Space Grotesk','Inter',sans-serif",
+  jakarta: "'Plus Jakarta Sans','Inter',sans-serif",
 };
+const THEMES = {
+  current: {
+    label: "Current", red: "#E8212B", redLight: "#FDEAEA", bg: "#F7F7F5", surface: "#FFFFFF",
+    border: "#E2E2DE", borderStrong: "#C8C8C2", textPrimary: "#1A1A18", textSecondary: "#6B6B65",
+    textMuted: "#9B9B95", green: "#1A7A4A", greenLight: "#EAF5EE", orange: "#C96A00", orangeLight: "#FFF3E0",
+    font: FONTS.inter, display: FONTS.inter, mono: SYS_MONO, radius: 8, radiusSm: 5, shadow: "none",
+  },
+  newsroom: {
+    label: "Newsroom", red: "#D81E28", redLight: "#FBE7E6", bg: "#F6F5F1", surface: "#FFFFFF",
+    border: "#E4E1D8", borderStrong: "#C9C4B6", textPrimary: "#17150F", textSecondary: "#5C574C",
+    textMuted: "#9A9482", green: "#1F7A46", greenLight: "#E9F4EC", orange: "#B5621A", orangeLight: "#FBEEDD",
+    font: FONTS.inter, display: FONTS.newsreader, mono: SYS_MONO, radius: 4, radiusSm: 3, shadow: "none",
+  },
+  signal: {
+    label: "Signal", red: "#E8212B", redLight: "#FCE8E8", bg: "#EEF2F6", surface: "#FFFFFF",
+    border: "#DCE3EB", borderStrong: "#B9C4D0", textPrimary: "#0F1A2A", textSecondary: "#52617A",
+    textMuted: "#8A98AC", green: "#0E7C5A", greenLight: "#E2F4EE", orange: "#C2740A", orangeLight: "#FCF0DC",
+    font: FONTS.grotesk, display: FONTS.grotesk, mono: SYS_MONO, radius: 8, radiusSm: 6,
+    shadow: "0 1px 2px rgba(16,26,42,0.06), 0 1px 3px rgba(16,26,42,0.04)",
+  },
+  local: {
+    label: "Local", red: "#E8212B", redLight: "#FFE9E4", bg: "#FFF8F2", surface: "#FFFFFF",
+    border: "#F0E6DC", borderStrong: "#E0CFBE", textPrimary: "#2A2019", textSecondary: "#7A6A5C",
+    textMuted: "#B0A192", green: "#1E9460", greenLight: "#E6F6EC", orange: "#F0792F", orangeLight: "#FFEEDF",
+    font: FONTS.jakarta, display: FONTS.jakarta, mono: SYS_MONO, radius: 14, radiusSm: 9,
+    shadow: "0 1px 2px rgba(120,80,40,0.05), 0 6px 20px rgba(120,80,40,0.05)",
+  },
+};
+const C = { ...THEMES.current };
+function applyTheme(key) { Object.assign(C, THEMES[key]); }
 
 // ---------------------------------------------------------------------------
 // Tokeniser — MUST stay in sync with scripts/shared.mjs so that baked-in data
@@ -127,6 +154,12 @@ const BM25_K1 = 1.5;       // term-frequency saturation
 const BM25_B = 0.6;        // length normalisation
 const TITLE_BOOST = 3.0;   // weight of title/keyword hits vs body
 const TRAFFIC_ALPHA = 0.3; // max relative lift from traffic (gentle re-rank)
+// Eligibility gate for the Find-links tab: a suggestion must match at least
+// this many query terms in its TITLE or FOCUS KEYWORD. Body-only matches are
+// passing mentions ("free ice cream" article that name-drops NDP once), not
+// related articles. Deliberately NOT applied to the Orphans tab — there a
+// body mention is exactly where you'd insert a link to the orphan.
+const MIN_TITLE_HITS = 1;
 
 function normUrl(raw) {
   if (!raw) return "";
@@ -183,6 +216,10 @@ const pick = (row, keys) => {
   for (const k of keys) if (row[k] != null && row[k] !== "") return row[k];
   return "";
 };
+// Stable article identity: the WordPress post ID survives slug renames and
+// headline rewrites — dedup key of choice; URL is the fallback for ID-less CSVs.
+const getId = (r) => pick(r, ["id", "post id", "post_id"]);
+const getStatus = (r) => pick(r, ["status", "post status", "post_status"]);
 const getTitle = (r) => pick(r, ["title", "page title", "article title", "post title", "name"]);
 const getUrl = (r) => pick(r, ["url", "page url", "link", "permalink", "address"]);
 const getKeyword = (r) => pick(r, ["keyword", "focus keyword", "focus keyphrase", "keyphrase"]);
@@ -290,6 +327,45 @@ function fmtDate(iso) {
   const color = yrs < 1 ? C.green : yrs < 2 ? C.textMuted : C.orange;
   return { label, color };
 }
+
+// ---------------------------------------------------------------------------
+// Anchor-text suggestions. Goal: concise, descriptive, contextual anchors —
+// NOT the full stuffed headline (over-optimised anchor text hurts SEO).
+// ---------------------------------------------------------------------------
+function cleanTitleAnchor(title) {
+  let t = (title || "").split(/\s[-–—|]\s|:\s/)[0];   // drop subtitle after - – — | :
+  t = t.replace(/^\d+\s+/, "");                        // drop leading list number "10 "
+  t = t.replace(/\s*\(?\b(?:19|20)\d{2}\b\)?\s*$/, ""); // drop trailing year
+  t = t.replace(/\s+(?:for|in|to)\s*$/i, "");          // dangling prepositions
+  return t.trim();
+}
+// The span of the target title covering the user's matched query terms,
+// bounded to the main title segment (before any subtitle separator).
+function contextAnchor(title, qStems) {
+  if (!qStems || !qStems.size) return null;
+  const words = (title || "").split(/\s[-–—|]\s|:\s/)[0].split(/\s+/);
+  const hits = [];
+  words.forEach((w, i) => {
+    const s = stem(w.toLowerCase().replace(/[^a-z0-9]/gi, ""));
+    if (s && qStems.has(s)) hits.push(i);
+  });
+  if (!hits.length) return null;
+  const lo = hits[0], hi = Math.min(hits[hits.length - 1], lo + 5);
+  return words.slice(lo, hi + 1).join(" ").replace(/^[^\w]+|[^\w]+$/g, "").trim();
+}
+function anchorSuggestions(a, qStems) {
+  const out = [];
+  const push = (s) => {
+    s = (s || "").trim();
+    if (s.length >= 2 && !out.some((o) => o.toLowerCase() === s.toLowerCase())) out.push(s);
+  };
+  push(contextAnchor(a.title, qStems)); // contextual first — best SEO fit
+  if (a.keyword) push(a.keyword);
+  push(cleanTitleAnchor(a.title));
+  push(a.title);                         // full headline as last resort
+  return out.slice(0, 4);
+}
+
 function useDebounce(value, ms) {
   const [v, setV] = useState(value);
   useEffect(() => {
@@ -340,14 +416,14 @@ function PasswordGate({ children }) {
   };
 
   return (
-    <div style={{ fontFamily: "'Inter','Helvetica Neue',Arial,sans-serif", background: C.bg, minHeight: "100vh",
+    <div style={{ fontFamily: C.font, background: C.bg, minHeight: "100vh",
       display: "flex", alignItems: "center", justifyContent: "center", padding: 24, color: C.textPrimary }}>
       <form onSubmit={submit} style={{ width: "100%", maxWidth: 360, background: C.surface,
         border: `1px solid ${C.border}`, borderTop: `3px solid ${C.red}`, borderRadius: 10,
         padding: "28px 28px 24px", boxShadow: "0 2px 16px rgba(0,0,0,0.05)" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 18 }}>
           <div style={{ background: C.red, color: "#fff", fontWeight: 800, fontSize: 11, letterSpacing: "0.08em", padding: "3px 7px", borderRadius: 3 }}>TSL</div>
-          <span style={{ fontWeight: 600, fontSize: 14 }}>Internal Linking Tool</span>
+          <span style={{ fontFamily: C.display, fontWeight: 600, fontSize: 15 }}>Internal Linking Tool</span>
         </div>
         <label style={{ fontSize: 11, fontWeight: 600, color: C.textSecondary, display: "block", marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.06em" }}>
           Password
@@ -547,7 +623,7 @@ function OrphanView({ dataset, copyUrl, copiedKey }) {
 
   return (
     <>
-      <div style={{ background: C.surface, borderRadius: 8, border: `1px solid ${C.border}`, padding: "14px 18px", marginBottom: 16 }}>
+      <div style={{ background: C.surface, borderRadius: C.radius, border: `1px solid ${C.border}`, padding: "14px 18px", marginBottom: 16 }}>
         <div style={{ fontSize: 13, color: C.textSecondary, lineHeight: 1.6 }}>
           Articles with few or no <b style={{ color: C.textPrimary }}>inbound internal links</b> — search engines crawl and rank
           them worse. Prioritise the high-traffic ones, then add links to them from the suggested related articles.
@@ -580,12 +656,12 @@ function OrphanView({ dataset, copyUrl, copiedKey }) {
       </div>
 
       {orphans.length === 0 ? (
-        <div style={{ textAlign: "center", padding: "40px 24px", color: C.textSecondary, fontSize: 13, background: C.surface, borderRadius: 8, border: `1px solid ${C.border}` }}>
+        <div style={{ textAlign: "center", padding: "40px 24px", color: C.textSecondary, fontSize: 13, background: C.surface, borderRadius: C.radius, border: `1px solid ${C.border}` }}>
           None match these filters. Try raising max inbound or lowering min views.
         </div>
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: 1 }}>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 90px 90px 90px", padding: "7px 14px", fontSize: 10, fontWeight: 700, letterSpacing: "0.07em", color: C.textMuted, textTransform: "uppercase", borderRadius: "8px 8px 0 0", background: C.bg, border: `1px solid ${C.border}` }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 90px 90px 90px", padding: "7px 14px", fontSize: 10, fontWeight: 700, letterSpacing: "0.07em", color: C.textMuted, textTransform: "uppercase", borderRadius: `${C.radius}px ${C.radius}px 0 0`, background: C.bg, border: `1px solid ${C.border}` }}>
             <span>Orphaned article</span>
             <span style={{ textAlign: "right" }}>Views</span>
             <span style={{ textAlign: "center" }}>Inbound</span>
@@ -596,10 +672,10 @@ function OrphanView({ dataset, copyUrl, copiedKey }) {
             const isOpen = selected === a.idx;
             return (
               <div key={a.url} style={{ background: C.surface, border: `1px solid ${C.border}`, borderTop: "none",
-                borderRadius: i === Math.min(orphans.length, 100) - 1 && !isOpen ? "0 0 8px 8px" : 0 }}>
+                borderRadius: i === Math.min(orphans.length, 100) - 1 && !isOpen ? `0 0 ${C.radius}px ${C.radius}px` : 0 }}>
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 90px 90px 90px", alignItems: "center", padding: "10px 14px" }}>
                   <div style={{ minWidth: 0 }}>
-                    <div style={{ fontSize: 13, fontWeight: 500, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{a.title}</div>
+                    <div style={{ fontFamily: C.display, fontSize: 14, fontWeight: 500, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{a.title}</div>
                     <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 2 }}>
                       <span style={{ fontSize: 10, color: C.textMuted, fontFamily: "monospace", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{shortUrl(a.url)}</span>
                       {fd && <span style={{ fontSize: 9, fontWeight: 600, color: fd.color, whiteSpace: "nowrap" }}>↻ {fd.label}</span>}
@@ -677,8 +753,30 @@ function TSLInternalLinker() {
   const [topN, setTopN] = useState(10);
   const [copiedKey, setCopiedKey] = useState(null);
   const [view, setView] = useState("find"); // "find" | "orphans"
+  const [anchorOpen, setAnchorOpen] = useState(null); // result url with open anchor panel
+  const [anchorText, setAnchorText] = useState("");
+  const [themeKey, setThemeKey] = useState("current"); // live design-direction preview
+  const changeTheme = (k) => { applyTheme(k); setThemeKey(k); };
 
   const debouncedQuery = useDebounce(sourceQuery, 200);
+
+  // Stemmed query terms — shared by the search and the contextual anchor
+  // builder — plus a stem -> original-word map so match chips in the results
+  // show what the user typed ("fireworks"), not the stem ("firework").
+  const [queryStems, queryWords] = useMemo(() => {
+    let qText = debouncedQuery;
+    if (sourceUrl) {
+      const seg = normUrl(sourceUrl).split("/").filter(Boolean).pop() || "";
+      qText += " " + seg.replace(/-/g, " ");
+    }
+    const words = new Map();
+    for (const raw of qText.toLowerCase().replace(/[^\w\s]/g, " ").split(/\s+/)) {
+      if (raw.length < 2 || STOPWORDS.has(raw)) continue;
+      const s = stem(raw);
+      if (!words.has(s)) words.set(s, raw);
+    }
+    return [new Set(words.keys()), words];
+  }, [debouncedQuery, sourceUrl]);
 
   // Load baked baseline once.
   useEffect(() => {
@@ -699,12 +797,17 @@ function TSLInternalLinker() {
     const articles = rows.map((r) => {
       const url = getUrl(r);
       const title = decodeEntities(getTitle(r));
+      if (!title || !url) return null;
+      // Only live articles — drafts export "?p=<id>" permalinks that
+      // normalise to "/" (same filter as the build script).
+      const status = getStatus(r).toLowerCase();
+      if (status && status !== "publish") return null;
+      if (normUrl(url) === "/") return null;
       const keyword = decodeEntities(getKeyword(r));
       const category = decodeEntities(getCategory(r));
-      if (!title || !url) return null;
       const tt = termFreq(`${title} ${keyword}`);
       const ct = termFreq(`${getContent(r)} ${category}`, CONTENT_TOKEN_CAP);
-      return { t: title, u: url, k: keyword, c: category, d: toISODate(getModified(r)), tt, ct };
+      return { i: getId(r), t: title, u: url, k: keyword, c: category, d: toISODate(getModified(r)), tt, ct };
     }).filter(Boolean);
     if (!articles.length) return;
     setIndexSources((prev) => [...prev, {
@@ -739,33 +842,56 @@ function TSLInternalLinker() {
   // per-doc weighted term-frequency bag, an inverted index, avg doc length, and
   // a percentile traffic weight (robust to the 6M-view homepage outlier).
   const dataset = useMemo(() => {
+    // Dedup by post ID (falls back to URL), same rules as the build script: a
+    // slug rename replaces the old row, and the old URL becomes an alias so
+    // its GA4 traffic still credits the article. keyByUrl lets an ID-less
+    // upload row still find the baseline article that owns its URL.
     const map = new Map();
-    for (const a of baseline.articles) map.set(normUrl(a.u), { ...a });
+    const keyByUrl = new Map();
+    const register = (key, a) => {
+      map.set(key, a);
+      keyByUrl.set(normUrl(a.u), key);
+      for (const al of a.al) keyByUrl.set(al, key);
+    };
+    for (const a of baseline.articles)
+      register(a.i ? `id:${a.i}` : normUrl(a.u), { ...a, al: a.al || [] });
     for (const src of indexSources)
       for (const a of src.articles) {
-        const key = normUrl(a.u);
+        const nu = normUrl(a.u);
+        const key = a.i ? `id:${a.i}` : keyByUrl.get(nu) || nu;
         const existing = map.get(key);
-        // Latest-modified-date wins: skip an upload that's older than what's
-        // already there (same safeguard as the build script).
-        if (existing && existing.d && a.d && a.d < existing.d) continue;
+        // Latest-modified-date wins: an older upload of the same post only
+        // contributes its (outdated) slug as an alias.
+        if (existing && existing.d && a.d && a.d < existing.d) {
+          if (nu !== normUrl(existing.u) && !existing.al.includes(nu)) {
+            existing.al.push(nu); keyByUrl.set(nu, key);
+          }
+          continue;
+        }
+        const al = existing ? [...existing.al] : [];
+        if (existing && normUrl(existing.u) !== nu && !al.includes(normUrl(existing.u))) al.push(normUrl(existing.u));
         // Keep baked sessions, and keep the baseline link graph if the upload
         // (which isn't link-parsed) doesn't carry one.
-        map.set(key, { ...a, s: existing ? existing.s : 0, lo: a.lo ?? existing?.lo });
+        register(key, { ...a, al: al.filter((x) => x !== nu), s: existing ? existing.s : 0, lo: a.lo ?? existing?.lo });
       }
     const addSess = new Map();
     for (const src of ga4Sources)
       for (const k in src.sessions) addSess.set(k, (addSess.get(k) || 0) + src.sessions[k]);
 
     const articles = [];
-    for (const [key, a] of map) {
-      const sessions = (a.s || 0) + (addSess.get(key) || 0);
+    for (const [, a] of map) {
+      // Baked sessions (a.s) already include alias traffic from the build;
+      // in-session GA4 uploads are attributed across canonical + alias URLs.
+      let sessions = a.s || 0;
+      for (const u of new Set([normUrl(a.u), ...a.al])) sessions += addSess.get(u) || 0;
       // Weighted bag: title/keyword terms count TITLE_BOOST×, body terms 1×.
       const bag = new Map();
       for (const [t, n] of a.tt || []) bag.set(t, (bag.get(t) || 0) + n * TITLE_BOOST);
       for (const [t, n] of a.ct || []) bag.set(t, (bag.get(t) || 0) + n);
       let dl = 0;
       for (const v of bag.values()) dl += v;
-      articles.push({ title: a.t, url: a.u, keyword: a.k || "", category: a.c || "", modified: a.d || "", sessions, bag, dl, lo: a.lo || [] });
+      const titleTerms = new Set((a.tt || []).map(([t]) => t));
+      articles.push({ title: a.t, url: a.u, keyword: a.k || "", category: a.c || "", modified: a.d || "", sessions, bag, dl, lo: a.lo || [], titleTerms, aliases: a.al });
     }
     articles.forEach((a, i) => { a.idx = i; });
 
@@ -806,13 +932,7 @@ function TSLInternalLinker() {
     const { articles } = dataset;
     if (!articles.length) return [];
     const srcUrlNorm = normUrl(sourceUrl);
-    // Query terms from the topic text + the URL slug (last path segment).
-    let qText = debouncedQuery;
-    if (sourceUrl) {
-      const seg = normUrl(sourceUrl).split("/").filter(Boolean).pop() || "";
-      qText += " " + seg.replace(/-/g, " ");
-    }
-    const q = [...new Set(tokenise(qText))];
+    const q = [...queryStems];
     if (!q.length) return [];
 
     // BM25: only docs sharing a query term are scored (via the inverted index).
@@ -825,27 +945,46 @@ function TSLInternalLinker() {
     const out = [];
     for (const [i, score] of bm) {
       const a = articles[i];
-      if (srcUrlNorm && normUrl(a.url) === srcUrlNorm) continue;
+      // Don't suggest the source article itself — match its current URL or any
+      // pre-rename alias (the writer may have pasted last year's slug).
+      if (srcUrlNorm && (normUrl(a.url) === srcUrlNorm || a.aliases.includes(srcUrlNorm))) continue;
+      // Match profile: where did each query term hit — title/keyword, body,
+      // or not at all. Drives the eligibility gate, the traffic-sort tiers,
+      // and the per-result match chips in the UI.
+      const matches = q.map((t) => [t, a.titleTerms.has(t) ? "title" : a.bag.has(t) ? "body" : null]);
+      let titleHits = 0, matched = 0;
+      for (const [, where] of matches) { if (where) matched++; if (where === "title") titleHits++; }
       const tw = a.trafficWeight || 0;
       // Relevance-first: traffic is a gentle multiplicative re-rank, never able
       // to lift a weak match over a strong one.
       const final = score * (1 + TRAFFIC_ALPHA * tw);
-      out.push({ ...a, rel: maxBm > 0 ? score / maxBm : 0, finalRaw: final, tw });
+      out.push({ ...a, rel: maxBm > 0 ? score / maxBm : 0, finalRaw: final, tw,
+        matches, titleHits, coverage: matched / q.length });
     }
     if (!out.length) return [];
 
-    let maxFinal = 0;
-    for (const o of out) if (o.finalRaw > maxFinal) maxFinal = o.finalRaw;
-    for (const o of out) o.combined = maxFinal > 0 ? o.finalRaw / maxFinal : 0; // 0–1 vs best match
+    // Gate: the topic must appear in the title or focus keyword, otherwise
+    // it's a passing mention. Fail open if NO article has a title hit, so an
+    // unusual query still returns something rather than a dead end.
+    const gated = out.filter((o) => o.titleHits >= MIN_TITLE_HITS);
+    const pool = gated.length ? gated : out;
 
-    return out
+    let maxFinal = 0;
+    for (const o of pool) if (o.finalRaw > maxFinal) maxFinal = o.finalRaw;
+    for (const o of pool) o.combined = maxFinal > 0 ? o.finalRaw / maxFinal : 0; // 0–1 vs best match
+
+    // Traffic sort is tiered by query coverage: articles matching more of the
+    // query terms rank first, ordered by sessions within each tier. Traffic
+    // re-orders topical matches — it never promotes an article that matches
+    // fewer of your terms past one that matches more, however popular.
+    return pool
       .filter((o) => o.combined * 100 >= minScore)
       .sort((a, b) =>
         sortBy === "traffic"
-          ? b.sessions - a.sessions || b.finalRaw - a.finalRaw
+          ? b.coverage - a.coverage || b.sessions - a.sessions || b.finalRaw - a.finalRaw
           : b.finalRaw - a.finalRaw)
       .slice(0, topN);
-  }, [dataset, debouncedQuery, sourceUrl, minScore, sortBy, topN]);
+  }, [dataset, queryStems, sourceUrl, minScore, sortBy, topN]);
 
   // Copy the bare URL so writers paste the link and choose their own
   // contextual anchor text (using the full headline as anchor is poor SEO).
@@ -854,6 +993,18 @@ function TSLInternalLinker() {
       setCopiedKey(a.url);
       setTimeout(() => setCopiedKey(null), 1500);
     });
+  };
+  // Copy a ready-to-paste anchor with the writer's chosen anchor text.
+  const copyLink = (url, anchor) => {
+    navigator.clipboard.writeText(`<a href="${url}">${anchor || url}</a>`).then(() => {
+      setCopiedKey("L:" + url);
+      setTimeout(() => setCopiedKey(null), 1500);
+    });
+  };
+  const toggleAnchor = (a) => {
+    if (anchorOpen === a.url) { setAnchorOpen(null); return; }
+    setAnchorOpen(a.url);
+    setAnchorText(anchorSuggestions(a, queryStems)[0] || a.title);
   };
 
   const articles = dataset.articles;
@@ -876,13 +1027,28 @@ function TSLInternalLinker() {
   ];
 
   return (
-    <div style={{ fontFamily: "'Inter','Helvetica Neue',Arial,sans-serif", background: C.bg, minHeight: "100vh", color: C.textPrimary }}>
+    <div style={{ fontFamily: C.font, background: C.bg, minHeight: "100vh", color: C.textPrimary }}>
+      {/* Design-direction preview switcher (temporary, for choosing a look) */}
+      <div style={{ position: "fixed", right: 16, bottom: 16, zIndex: 50, display: "flex", alignItems: "center", gap: 6,
+        background: C.surface, border: `1px solid ${C.borderStrong}`, borderRadius: 999, padding: "6px 8px 6px 12px",
+        boxShadow: "0 4px 16px rgba(0,0,0,0.12)" }}>
+        <span style={{ fontSize: 10, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.06em", marginRight: 2 }}>Design</span>
+        {Object.entries(THEMES).map(([k, t]) => (
+          <button key={k} onClick={() => changeTheme(k)} title={t.label}
+            style={{ padding: "4px 10px", borderRadius: 999, border: `1px solid ${themeKey === k ? C.red : C.border}`,
+              background: themeKey === k ? C.red : C.bg, color: themeKey === k ? "#fff" : C.textSecondary,
+              fontSize: 11, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" }}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+
       {/* Header */}
       <div style={{ borderBottom: `3px solid ${C.red}`, background: C.surface, padding: "0 24px" }}>
         <div style={{ maxWidth: 980, margin: "0 auto", display: "flex", alignItems: "center", justifyContent: "space-between", height: 52 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
             <div style={{ background: C.red, color: "#fff", fontWeight: 800, fontSize: 11, letterSpacing: "0.08em", padding: "3px 7px", borderRadius: 3 }}>TSL</div>
-            <span style={{ fontWeight: 600, fontSize: 14 }}>Internal Linking Tool</span>
+            <span style={{ fontFamily: C.display, fontWeight: 600, fontSize: 15 }}>Internal Linking Tool</span>
           </div>
           {hasData && (
             <div style={{ display: "flex", gap: 16, fontSize: 11 }}>
@@ -915,7 +1081,7 @@ function TSLInternalLinker() {
 
       <div style={{ maxWidth: 980, margin: "0 auto", padding: "24px 24px 48px" }}>
         {/* Data sources */}
-        <div style={{ background: C.surface, borderRadius: 8, border: `1px solid ${C.border}`, padding: "16px 18px", marginBottom: 16 }}>
+        <div style={{ background: C.surface, borderRadius: C.radius, border: `1px solid ${C.border}`, padding: "16px 18px", marginBottom: 16 }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
             <div style={{ fontWeight: 600, fontSize: 13 }}>Data sources</div>
             {baseline.meta && (
@@ -988,7 +1154,7 @@ function TSLInternalLinker() {
         {/* Stats strip */}
         {hasData && (
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 1, marginBottom: 16,
-            border: `1px solid ${C.border}`, borderRadius: 8, overflow: "hidden" }}>
+            border: `1px solid ${C.border}`, borderRadius: C.radius, overflow: "hidden" }}>
             {[
               ["Articles indexed", fmt(articles.length), C.green],
               ["With GA4 traffic", hasGA4 ? fmt(withTraffic) : "—", hasGA4 ? C.green : C.textMuted],
@@ -1012,7 +1178,7 @@ function TSLInternalLinker() {
         {view === "orphans" && (hasData
           ? <OrphanView dataset={dataset} copyUrl={copyUrl} copiedKey={copiedKey} />
           : baselineState !== "loading" && (
-            <div style={{ textAlign: "center", padding: "48px 24px", color: C.textSecondary, fontSize: 13, background: C.surface, borderRadius: 8, border: `1px solid ${C.border}` }}>
+            <div style={{ textAlign: "center", padding: "48px 24px", color: C.textSecondary, fontSize: 13, background: C.surface, borderRadius: C.radius, border: `1px solid ${C.border}` }}>
               <div style={{ fontSize: 28, marginBottom: 12 }}>🕸</div>
               <div style={{ fontWeight: 600, color: C.textPrimary, marginBottom: 6 }}>No article data loaded yet</div>
               <div>Load the article index (run <code>npm run build-data</code> or add a CSV above) to find orphaned articles.</div>
@@ -1021,7 +1187,7 @@ function TSLInternalLinker() {
 
         {view === "find" && <>
         {/* Source article inputs */}
-        <div style={{ background: C.surface, borderRadius: 8, border: `1px solid ${C.border}`, padding: "18px 20px", marginBottom: 16 }}>
+        <div style={{ background: C.surface, borderRadius: C.radius, border: `1px solid ${C.border}`, padding: "18px 20px", marginBottom: 16 }}>
           <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 14 }}>Source article</div>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
             {[
@@ -1078,67 +1244,113 @@ function TSLInternalLinker() {
         {/* Results */}
         {hasData && hasQuery && (
           suggestions.length === 0 ? (
-            <div style={{ textAlign: "center", padding: "40px 24px", color: C.textSecondary, fontSize: 13, background: C.surface, borderRadius: 8, border: `1px solid ${C.border}` }}>
+            <div style={{ textAlign: "center", padding: "40px 24px", color: C.textSecondary, fontSize: 13, background: C.surface, borderRadius: C.radius, border: `1px solid ${C.border}` }}>
               No matches above score {minScore}. Try lowering the threshold or broadening your topic.
             </div>
           ) : (
             <div style={{ display: "flex", flexDirection: "column", gap: 1 }}>
-              <div style={{ display: "grid", gridTemplateColumns: "36px 1fr 90px 90px 110px 80px", padding: "7px 14px", fontSize: 10, fontWeight: 700, letterSpacing: "0.07em", color: C.textMuted, textTransform: "uppercase", borderRadius: "8px 8px 0 0", background: C.bg, border: `1px solid ${C.border}` }}>
+              <div style={{ display: "grid", gridTemplateColumns: "34px 1fr 78px 82px 102px 104px", padding: "7px 14px", fontSize: 10, fontWeight: 700, letterSpacing: "0.07em", color: C.textMuted, textTransform: "uppercase", borderRadius: `${C.radius}px ${C.radius}px 0 0`, background: C.bg, border: `1px solid ${C.border}` }}>
                 <span>#</span><span>Article</span>
                 <span style={{ textAlign: "right" }}>Sessions</span>
                 <span style={{ textAlign: "center" }}>Traffic</span>
                 <span style={{ textAlign: "center" }}>Score</span>
-                <span style={{ textAlign: "center" }}>Copy</span>
+                <span style={{ textAlign: "center" }}>Add link</span>
               </div>
-              {suggestions.map((a, i) => (
-                <div key={a.url + i}
-                  style={{ display: "grid", gridTemplateColumns: "36px 1fr 90px 90px 110px 80px", alignItems: "center", padding: "10px 14px", background: C.surface, border: `1px solid ${C.border}`, borderTop: "none", borderRadius: i === suggestions.length - 1 ? "0 0 8px 8px" : 0 }}
-                  onMouseEnter={(e) => (e.currentTarget.style.background = "#FAFAF8")}
-                  onMouseLeave={(e) => (e.currentTarget.style.background = C.surface)}>
-                  <span style={{ fontSize: 11, fontWeight: 700, color: i < 3 ? C.red : C.textMuted, fontVariantNumeric: "tabular-nums" }}>{i + 1}</span>
-                  <div style={{ minWidth: 0 }}>
-                    <div style={{ fontSize: 13, fontWeight: 500, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{a.title}</div>
-                    <div style={{ fontSize: 10, color: C.textMuted, marginTop: 2, fontFamily: "monospace", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{shortUrl(a.url)}</div>
-                    <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 3, flexWrap: "wrap" }}>
-                      {a.keyword && <span style={{ display: "inline-block", fontSize: 9, fontWeight: 600, color: C.textSecondary, background: C.bg, border: `1px solid ${C.border}`, borderRadius: 3, padding: "1px 5px" }}>{a.keyword}</span>}
-                      {(() => { const fd = fmtDate(a.modified); return fd && <span style={{ fontSize: 9, fontWeight: 600, color: fd.color }}>↻ {fd.label}</span>; })()}
+              {suggestions.map((a, i) => {
+                const open = anchorOpen === a.url;
+                const last = i === suggestions.length - 1;
+                return (
+                <div key={a.url + i} style={{ background: C.surface, border: `1px solid ${C.border}`, borderTop: "none", borderRadius: last && !open ? `0 0 ${C.radius}px ${C.radius}px` : 0 }}>
+                  <div style={{ display: "grid", gridTemplateColumns: "34px 1fr 78px 82px 102px 104px", alignItems: "center", padding: "10px 14px" }}
+                    onMouseEnter={(e) => (e.currentTarget.style.background = "#FAFAF8")}
+                    onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}>
+                    <span style={{ fontSize: 11, fontWeight: 700, color: i < 3 ? C.red : C.textMuted, fontVariantNumeric: "tabular-nums" }}>{i + 1}</span>
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontFamily: C.display, fontSize: 14, fontWeight: 500, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{a.title}</div>
+                      <div style={{ fontSize: 10, color: C.textMuted, marginTop: 2, fontFamily: "monospace", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{shortUrl(a.url)}</div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 3, flexWrap: "wrap" }}>
+                        {a.keyword && <span style={{ display: "inline-block", fontSize: 9, fontWeight: 600, color: C.textSecondary, background: C.bg, border: `1px solid ${C.border}`, borderRadius: 3, padding: "1px 5px" }}>{a.keyword}</span>}
+                        {(() => { const fd = fmtDate(a.modified); return fd && <span style={{ fontSize: 9, fontWeight: 600, color: fd.color }}>↻ {fd.label}</span>; })()}
+                        {(a.matches || []).map(([s, where]) => (
+                          <span key={s} title={where === "title" ? "matched in title/keyword" : where === "body" ? "matched in body only" : "not matched"}
+                            style={{ display: "inline-block", fontSize: 9, fontWeight: 600, borderRadius: 3, padding: "1px 5px",
+                              background: where === "title" ? C.greenLight : where === "body" ? C.bg : "transparent",
+                              color: where === "title" ? C.green : where === "body" ? C.textSecondary : C.textMuted,
+                              border: `1px ${where ? "solid" : "dashed"} ${where === "title" ? C.green : C.border}`,
+                              textDecoration: where ? "none" : "line-through" }}>
+                            {queryWords.get(s) || s}{where === "title" ? " ✓" : ""}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                    <div style={{ textAlign: "right", fontSize: 12, fontWeight: 500, fontVariantNumeric: "tabular-nums", color: a.sessions > 0 ? C.textPrimary : C.textMuted }}>
+                      {a.sessions > 0 ? fmt(a.sessions) : "—"}
+                    </div>
+                    <div style={{ display: "flex", justifyContent: "center" }}>
+                      {a.sessions > 0 ? <TrafficBar weight={a.trafficWeight} /> : <span style={{ fontSize: 10, color: C.textMuted }}>no data</span>}
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 3 }}>
+                      <ScorePill score={a.combined} />
+                      <span style={{ fontSize: 9, color: C.textMuted }}>rel {Math.round(a.rel * 100)} · trfc {Math.round(a.trafficWeight * 100)}</span>
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                      <button onClick={() => copyUrl(a)}
+                        style={{ padding: "4px 8px", borderRadius: 5, border: `1px solid ${C.border}`,
+                          background: copiedKey === a.url ? C.greenLight : C.bg,
+                          color: copiedKey === a.url ? C.green : C.textSecondary,
+                          fontSize: 10, cursor: "pointer", fontFamily: "inherit", fontWeight: 600, whiteSpace: "nowrap" }}>
+                        {copiedKey === a.url ? "Copied!" : "Copy URL"}
+                      </button>
+                      <button onClick={() => toggleAnchor(a)}
+                        style={{ padding: "4px 8px", borderRadius: 5, border: `1px solid ${open ? C.red : C.border}`,
+                          background: open ? C.red : C.bg, color: open ? "#fff" : C.textSecondary,
+                          fontSize: 10, cursor: "pointer", fontFamily: "inherit", fontWeight: 600, whiteSpace: "nowrap" }}>
+                        {open ? "Close" : "✎ Anchor"}
+                      </button>
                     </div>
                   </div>
-                  <div style={{ textAlign: "right", fontSize: 12, fontWeight: 500, fontVariantNumeric: "tabular-nums", color: a.sessions > 0 ? C.textPrimary : C.textMuted }}>
-                    {a.sessions > 0 ? fmt(a.sessions) : "—"}
-                  </div>
-                  <div style={{ display: "flex", justifyContent: "center" }}>
-                    {a.sessions > 0 ? <TrafficBar weight={a.trafficWeight} /> : <span style={{ fontSize: 10, color: C.textMuted }}>no data</span>}
-                  </div>
-                  <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 3 }}>
-                    <ScorePill score={a.combined} />
-                    <span style={{ fontSize: 9, color: C.textMuted }}>rel {Math.round(a.rel * 100)} · trfc {Math.round(a.trafficWeight * 100)}</span>
-                  </div>
-                  <div style={{ display: "flex", justifyContent: "center" }}>
-                    <button onClick={() => copyUrl(a)}
-                      style={{ padding: "5px 10px", borderRadius: 5, border: `1px solid ${C.border}`,
-                        background: copiedKey === a.url ? C.greenLight : C.bg,
-                        color: copiedKey === a.url ? C.green : C.textSecondary,
-                        fontSize: 11, cursor: "pointer", fontFamily: "inherit", fontWeight: 600, whiteSpace: "nowrap" }}>
-                      {copiedKey === a.url ? "Copied!" : "Copy URL"}
-                    </button>
-                  </div>
+                  {open && (
+                    <div style={{ padding: "2px 16px 14px 48px", borderTop: `1px dashed ${C.border}`, background: "#FAFAF8" }}>
+                      <div style={{ fontSize: 11, fontWeight: 700, color: C.textSecondary, margin: "10px 0 6px" }}>Suggested anchor text — pick one or edit:</div>
+                      <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8 }}>
+                        {anchorSuggestions(a, queryStems).map((s) => (
+                          <button key={s} onClick={() => setAnchorText(s)}
+                            style={{ fontSize: 11, padding: "3px 9px", borderRadius: 12, cursor: "pointer", fontFamily: "inherit",
+                              border: `1px solid ${anchorText === s ? C.red : C.border}`, background: anchorText === s ? C.redLight : C.surface,
+                              color: anchorText === s ? C.red : C.textSecondary, fontWeight: anchorText === s ? 700 : 500 }}>{s}</button>
+                        ))}
+                      </div>
+                      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                        <input value={anchorText} onChange={(e) => setAnchorText(e.target.value)} placeholder="anchor text"
+                          style={{ flex: 1, boxSizing: "border-box", border: `1px solid ${C.border}`, borderRadius: 6, padding: "7px 10px", fontSize: 13, outline: "none", fontFamily: "inherit", color: C.textPrimary, background: C.surface }}
+                          onFocus={(e) => (e.target.style.borderColor = C.red)} onBlur={(e) => (e.target.style.borderColor = C.border)} />
+                        <button onClick={() => copyLink(a.url, anchorText)}
+                          style={{ padding: "7px 14px", borderRadius: 6, border: "none", background: copiedKey === "L:" + a.url ? C.green : C.red, color: "#fff", fontSize: 12, fontWeight: 700, fontFamily: "inherit", cursor: "pointer", whiteSpace: "nowrap" }}>
+                          {copiedKey === "L:" + a.url ? "Copied!" : "Copy link"}
+                        </button>
+                      </div>
+                      <div style={{ marginTop: 6, fontSize: 10, color: C.textMuted, fontFamily: "monospace", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                        {`<a href="${shortUrl(a.url)}">`}<span style={{ color: C.textSecondary }}>{anchorText || "anchor text"}</span>{"</a>"}
+                      </div>
+                    </div>
+                  )}
                 </div>
-              ))}
+                );
+              })}
             </div>
           )
         )}
 
         {/* Empty / guidance states */}
         {!hasData && baselineState !== "loading" && (
-          <div style={{ textAlign: "center", padding: "48px 24px", color: C.textSecondary, fontSize: 13, lineHeight: 1.7, background: C.surface, borderRadius: 8, border: `1px solid ${C.border}` }}>
+          <div style={{ textAlign: "center", padding: "48px 24px", color: C.textSecondary, fontSize: 13, lineHeight: 1.7, background: C.surface, borderRadius: C.radius, border: `1px solid ${C.border}` }}>
             <div style={{ fontSize: 28, marginBottom: 12 }}>📎</div>
             <div style={{ fontWeight: 600, color: C.textPrimary, marginBottom: 6 }}>No article data loaded yet</div>
             <div>Run <code>npm run build-data</code> to bake in the article index + GA4 exports, or add a CSV above.</div>
           </div>
         )}
         {hasData && !hasQuery && (
-          <div style={{ textAlign: "center", padding: "36px 24px", color: C.textSecondary, fontSize: 13, background: C.surface, borderRadius: 8, border: `1px solid ${C.border}` }}>
+          <div style={{ textAlign: "center", padding: "36px 24px", color: C.textSecondary, fontSize: 13, background: C.surface, borderRadius: C.radius, border: `1px solid ${C.border}` }}>
             <div style={{ fontSize: 22, marginBottom: 8 }}>✏️</div>
             <div style={{ fontWeight: 600, color: C.textPrimary, marginBottom: 4 }}>Enter a topic above to see link suggestions</div>
             <div>Describe the article you're editing — or paste its URL — to find the most relevant TSL articles to link to.</div>
@@ -1146,7 +1358,7 @@ function TSLInternalLinker() {
         )}
         {hasData && suggestions.length > 0 && (
           <div style={{ marginTop: 16, padding: "10px 14px", borderRadius: 6, background: C.bg, border: `1px solid ${C.border}`, fontSize: 10, color: C.textMuted, lineHeight: 1.8 }}>
-            <b style={{ color: C.textSecondary }}>Score</b> = BM25 relevance (title/keyword weighted {TITLE_BOOST}× above body; generic words down-weighted by frequency), shown relative to the top match, with a gentle traffic re-rank. · <b style={{ color: C.textSecondary }}>Copy URL</b> copies the article link so you can write your own contextual anchor text.
+            <b style={{ color: C.textSecondary }}>Score</b> = BM25 relevance (title/keyword weighted {TITLE_BOOST}× above body; generic words down-weighted by frequency), shown relative to the top match, with a gentle traffic re-rank. Suggestions must match your topic in the <b style={{ color: C.textSecondary }}>title or focus keyword</b> — body-only mentions are excluded. · <b style={{ color: C.textSecondary }}>Sort by traffic</b> ranks articles matching more of your terms first, by sessions within each tier. · <b style={{ color: C.textSecondary }}>Copy URL</b> copies the article link so you can write your own contextual anchor text.
             {monthsCovered.length > 0 && <> · <b style={{ color: C.textSecondary }}>Traffic</b> = cumulative sessions across {monthsCovered.join(", ")}.</>}
           </div>
         )}
