@@ -251,6 +251,10 @@ const getSessions = (r) => {
 };
 const getModified = (r) =>
   pick(r, ["post modified date", "modified", "post modified", "last modified", "modified date", "date modified", "updated"]);
+// Original publish date — the real content-age signal (modified date is skewed
+// by the 2019 /read/ migration re-save). Age-gates the orphan list.
+const getPublished = (r) =>
+  pick(r, ["date", "post date", "published", "publish date", "date published", "post published"]);
 function toISODate(str) {
   if (!str) return "";
   const s = String(str).trim();
@@ -586,13 +590,19 @@ function OrphanView({ dataset, copyUrl, copiedKey }) {
   const { articles, inboundAdj } = dataset;
   const [maxInbound, setMaxInbound] = useState(0);
   const [minViews, setMinViews] = useState(1000);
+  const [sinceYear, setSinceYear] = useState(2019); // 0 = all years
   const [selected, setSelected] = useState(null); // article idx
 
   const orphans = useMemo(() => {
+    // Age gate uses original publish date. Undated articles pass — we don't hide
+    // what we can't date. Older content is slated for a rework, so surfacing it
+    // as an orphan to fix isn't actionable.
+    const minDate = sinceYear ? `${sinceYear}-01-01` : "";
     return articles
-      .filter((a) => a.inbound <= maxInbound && a.sessions >= minViews)
+      .filter((a) => a.inbound <= maxInbound && a.sessions >= minViews
+        && (!minDate || !a.published || a.published >= minDate))
       .sort((a, b) => b.sessions - a.sessions);
-  }, [articles, maxInbound, minViews]);
+  }, [articles, maxInbound, minViews, sinceYear]);
 
   // For a selected orphan, suggest high-relevance source articles that should
   // link to it — excluding itself and any that already link to it.
@@ -625,8 +635,10 @@ function OrphanView({ dataset, copyUrl, copiedKey }) {
     <>
       <div style={{ background: C.surface, borderRadius: C.radius, border: `1px solid ${C.border}`, padding: "14px 18px", marginBottom: 16 }}>
         <div style={{ fontSize: 13, color: C.textSecondary, lineHeight: 1.6 }}>
-          Articles with few or no <b style={{ color: C.textPrimary }}>inbound internal links</b> — search engines crawl and rank
-          them worse. Prioritise the high-traffic ones, then add links to them from the suggested related articles.
+          Articles with few or no <b style={{ color: C.textPrimary }}>inbound internal links</b> from other articles — search
+          engines crawl and rank them worse. Only article-to-article (<code>/read/</code>) links count; nav, category and tag
+          links are ignored. Pre-2019 posts are hidden by default (slated for content rework). Prioritise the high-traffic ones,
+          then add links to them from the suggested related articles.
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 18, flexWrap: "wrap", marginTop: 14 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -647,6 +659,16 @@ function OrphanView({ dataset, copyUrl, copiedKey }) {
               <option value={1000}>1k+</option>
               <option value={5000}>5k+</option>
               <option value={20000}>20k+</option>
+            </select>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <label style={{ fontSize: 11, color: C.textSecondary }}>Published since</label>
+            <select value={sinceYear} onChange={(e) => { setSinceYear(+e.target.value); setSelected(null); }}
+              style={{ border: `1px solid ${C.border}`, borderRadius: 4, padding: "3px 6px", fontSize: 11, fontFamily: "inherit", background: C.bg, color: C.textPrimary }}>
+              <option value={2019}>2019+ (skip old)</option>
+              <option value={2022}>2022+</option>
+              <option value={2024}>2024+</option>
+              <option value={0}>All years</option>
             </select>
           </div>
           <div style={{ marginLeft: "auto", fontSize: 11, color: C.textSecondary }}>
@@ -807,7 +829,7 @@ function TSLInternalLinker() {
       const category = decodeEntities(getCategory(r));
       const tt = termFreq(`${title} ${keyword}`);
       const ct = termFreq(`${getContent(r)} ${category}`, CONTENT_TOKEN_CAP);
-      return { i: getId(r), t: title, u: url, k: keyword, c: category, d: toISODate(getModified(r)), tt, ct };
+      return { i: getId(r), t: title, u: url, k: keyword, c: category, d: toISODate(getModified(r)), p: toISODate(getPublished(r)), tt, ct };
     }).filter(Boolean);
     if (!articles.length) return;
     setIndexSources((prev) => [...prev, {
@@ -891,7 +913,7 @@ function TSLInternalLinker() {
       let dl = 0;
       for (const v of bag.values()) dl += v;
       const titleTerms = new Set((a.tt || []).map(([t]) => t));
-      articles.push({ title: a.t, url: a.u, keyword: a.k || "", category: a.c || "", modified: a.d || "", sessions, bag, dl, lo: a.lo || [], titleTerms, aliases: a.al });
+      articles.push({ title: a.t, url: a.u, keyword: a.k || "", category: a.c || "", modified: a.d || "", published: a.p || "", sessions, bag, dl, lo: a.lo || [], titleTerms, aliases: a.al });
     }
     articles.forEach((a, i) => { a.idx = i; });
 
@@ -1066,7 +1088,7 @@ function TSLInternalLinker() {
         <div style={{ maxWidth: 980, margin: "0 auto", display: "flex", gap: 4 }}>
           {[
             ["find", "🔗 Find links"],
-            ["orphans", `🕸 Orphans${baseline.meta?.orphanCount ? ` · ${fmt(baseline.meta.orphanCount)}` : ""}`],
+            ["orphans", `🕸 Orphans${(baseline.meta?.recentOrphanCount ?? baseline.meta?.orphanCount) ? ` · ${fmt(baseline.meta.recentOrphanCount ?? baseline.meta.orphanCount)}` : ""}`],
           ].map(([v, label]) => (
             <button key={v} onClick={() => setView(v)}
               style={{ padding: "11px 14px", border: "none", background: "transparent", cursor: "pointer",

@@ -25,8 +25,12 @@ import { fileURLToPath } from "node:url";
 import {
   streamCSV, normaliseUrl, termFreq, decodeEntities, extractInternalLinks,
   getId, getStatus, getTitle, getUrl, getKeyword, getCategory, getContent,
-  getPath, getSessions, getModified, toISODate, labelFromName,
+  getPath, getSessions, getModified, getPublished, toISODate, labelFromName,
 } from "./shared.mjs";
+
+// Orphans published before this year are assumed to be reworked in a future
+// content overhaul, so they're not counted in the "actionable" headline.
+const ORPHAN_MIN_YEAR = 2019;
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const INDEX_DIR = join(ROOT, "data", "index");
@@ -61,6 +65,7 @@ for (const f of csvFiles(INDEX_DIR)) {
     const id = getId(r);
     const key = id ? `id:${id}` : keyByUrl.get(nu) || nu;
     const d = toISODate(getModified(r));
+    const p = toISODate(getPublished(r));
     const prev = articles.get(key);
     // Newest-modified-date wins — deterministic across import order. A losing
     // row with a different URL is an outdated slug: keep it as an alias.
@@ -79,7 +84,7 @@ for (const f of csvFiles(INDEX_DIR)) {
     const al = prev ? prev.al : new Set();
     if (prev && prev.nu !== nu) al.add(prev.nu);
     al.delete(nu);
-    articles.set(key, { id, t: title, u: url, nu, k: keyword, c: category, d, tt, ct, out, al });
+    articles.set(key, { id, t: title, u: url, nu, k: keyword, c: category, d, p, tt, ct, out, al });
     keyByUrl.set(nu, key);
     added++;
   });
@@ -134,12 +139,18 @@ for (let i = 0; i < entries.length; i++) {
     seen.add(j); lo.push(j); inboundCount[j]++; totalLinks++;
   }
   out.push({
-    t: a.t, u: a.u, k: a.k, c: a.c, d: a.d, s: sessions, tt: a.tt, ct: a.ct, lo,
+    t: a.t, u: a.u, k: a.k, c: a.c, d: a.d, p: a.p, s: sessions, tt: a.tt, ct: a.ct, lo,
     ...(a.id ? { i: a.id } : {}), ...(a.al.size ? { al: [...a.al] } : {}),
   });
 }
 const orphanCount = inboundCount.filter((c) => c === 0).length;
 const weakCount = inboundCount.filter((c) => c > 0 && c <= 2).length;
+// Actionable orphans: 0 inbound AND published in ORPHAN_MIN_YEAR or later (older
+// content is slated for a rework, so it isn't worth chasing links for). Undated
+// articles are counted — we don't hide what we can't age.
+const minDate = `${ORPHAN_MIN_YEAR}-01-01`;
+const recentOrphanCount = entries.reduce(
+  (n, a, i) => n + (inboundCount[i] === 0 && (!a.p || a.p >= minDate) ? 1 : 0), 0);
 
 if (!existsSync(dirname(OUT))) mkdirSync(dirname(OUT), { recursive: true });
 const payload = {
@@ -150,6 +161,8 @@ const payload = {
     totalSessions,
     totalLinks,
     orphanCount,
+    recentOrphanCount,
+    orphanMinYear: ORPHAN_MIN_YEAR,
     weakCount,
     indexMonths,
     ga4Months,
@@ -162,5 +175,5 @@ writeFileSync(OUT, json);
 const sizeMB = (Buffer.byteLength(json) / (1024 * 1024)).toFixed(2);
 console.log(`\n✓ Wrote ${OUT}`);
 console.log(`  ${out.length.toLocaleString()} articles · ${withTraffic.toLocaleString()} with traffic · ${totalSessions.toLocaleString()} total sessions · ${sizeMB} MB`);
-console.log(`  link graph: ${totalLinks.toLocaleString()} internal links · ${orphanCount.toLocaleString()} orphans (0 inbound) · ${weakCount.toLocaleString()} weak (1–2 inbound)`);
+console.log(`  link graph: ${totalLinks.toLocaleString()} internal links · ${orphanCount.toLocaleString()} orphans (0 inbound, ${recentOrphanCount.toLocaleString()} published ${ORPHAN_MIN_YEAR}+) · ${weakCount.toLocaleString()} weak (1–2 inbound)`);
 if (!out.length) console.log("  (no data found — drop CSVs into data/index and data/ga4, then re-run)");

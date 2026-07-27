@@ -140,7 +140,11 @@ export function extractInternalLinks(html) {
       /^\/\/(www\.)?thesmartlocal\.com/i.test(href);
     if (!internal) continue;
     const n = normaliseUrl(href.replace(/^\/\//, "https://"));
-    if (n) out.add(n);
+    // Article-to-article links only: real TSL articles all live under /read/.
+    // Ignore nav/utility pages, /category/ + /tags/ archives, wp-content images,
+    // and legacy pre-migration URL schemes — none are articles, so counting them
+    // would never resolve anyway and just muddies intent.
+    if (n && n.startsWith("/read/")) out.add(n);
   }
   return [...out];
 }
@@ -292,6 +296,12 @@ export const getSessions = (r) => {
 // Last-modified date drives the freshness signal + URL-collision tiebreak.
 export const getModified = (r) =>
   pick(r, ["post modified date", "modified", "post modified", "last modified", "modified date", "date modified", "updated"]);
+
+// Original publish date — the true content-age signal. Modified date is useless
+// for age here: a 2019 bulk re-save (the /read/ migration) stamped ~4k old posts
+// with a 2019 modified date. Used to age-gate the orphan list.
+export const getPublished = (r) =>
+  pick(r, ["date", "post date", "published", "publish date", "date published", "post published"]);
 
 // Normalise a date string to ISO "YYYY-MM-DD" (lexically sortable) or "".
 export function toISODate(str) {
